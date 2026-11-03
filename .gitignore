@@ -1,0 +1,28 @@
+# Secrets & local configuration
+.env
+.env.*
+!.env.example
+
+# Rust build artifacts
+/target/
+
+# Python virtual environments & caches
+/env/
+/venv/
+/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.hypothesis/
+
+# Runtime logs & PID files
+*.log
+*.pid
+
+# Editor & OS files
+.vscode/
+.idea/
+.kiro/
+.DS_Store
+Thumbs.db

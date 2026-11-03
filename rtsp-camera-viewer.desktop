@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=NVR Command Center
+Comment=Ultra-low-latency GPU multi-camera NVR & Cloud P2P command center
+Exec=rtsp-camera-viewer
+Icon=rtsp-camera-viewer
+Terminal=false
+Categories=Video;AudioVideo;
+Keywords=camera;rtsp;nvr;p2p;surveillance;video;rust;
+StartupNotify=true
+StartupWMClass=rtsp-camera-viewer

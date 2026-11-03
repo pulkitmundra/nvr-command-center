@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0B1120"/>
+      <stop offset="50%" stop-color="#0F172A"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="50%" stop-color="#06B6D4"/>
+      <stop offset="100%" stop-color="#3B82F6"/>
+    </linearGradient>
+    <radialGradient id="lensGrad" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#1E3A8A"/>
+      <stop offset="65%" stop-color="#090D16"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </radialGradient>
+  </defs>
+
+  <!-- Rounded App Icon Background -->
+  <rect x="12" y="12" width="232" height="232" rx="52" fill="url(#bgGrad)" stroke="url(#ringGrad)" stroke-width="6"/>
+
+  <!-- Subtle Surveillance Grid Lines in Background -->
+  <g stroke="#1E293B" stroke-width="2" opacity="0.75">
+    <line x1="12" y1="90" x2="244" y2="90"/>
+    <line x1="12" y1="166" x2="244" y2="166"/>
+    <line x1="90" y1="12" x2="90" y2="244"/>
+    <line x1="166" y1="12" x2="166" y2="244"/>
+  </g>
+
+  <!-- Corner Viewfinder Brackets -->
+  <g fill="none" stroke="#38BDF8" stroke-width="4" stroke-linecap="round" opacity="0.85">
+    <path d="M 38 62 L 38 42 Q 38 38 42 38 L 62 38"/>
+    <path d="M 194 38 L 214 38 Q 218 38 218 42 L 218 62"/>
+    <path d="M 38 194 L 38 214 Q 38 218 42 218 L 62 218"/>
+    <path d="M 194 218 L 214 218 Q 218 218 218 214 L 218 194"/>
+  </g>
+
+  <!-- Outer Camera Aperture Ring -->
+  <circle cx="128" cy="128" r="70" fill="#090D16" stroke="url(#ringGrad)" stroke-width="7"/>
+  <circle cx="128" cy="128" r="56" fill="url(#lensGrad)" stroke="#334155" stroke-width="3"/>
+
+  <!-- Inner Optical Lens Elements -->
+  <circle cx="128" cy="128" r="34" fill="#020617" stroke="#06B6D4" stroke-width="3" opacity="0.9"/>
+  <circle cx="128" cy="128" r="14" fill="#0EA5E9" opacity="0.35"/>
+
+  <!-- Lens Specular Glint -->
+  <circle cx="108" cy="106" r="10" fill="#E0F2FE" opacity="0.65"/>
+  <circle cx="144" cy="146" r="5" fill="#38BDF8" opacity="0.45"/>
+
+  <!-- Top-Right Live Recording/Streaming Emerald Indicator Dot -->
+  <circle cx="198" cy="58" r="12" fill="#064E3B"/>
+  <circle cx="198" cy="58" r="7" fill="#10B981"/>
+</svg>
