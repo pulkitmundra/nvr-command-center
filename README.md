@@ -1,6 +1,7 @@
 # NVR Command Center v2.1 (Native Rust + GPU + Cloud P2P)
 
 [![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
+[![Snap Store](https://img.shields.io/badge/Snap_Store-nvr--command--center-82BEA0?logo=snapcraft&logoColor=white)](https://snapcraft.io/nvr-command-center)
 [![Rust](https://img.shields.io/badge/Rust-Native_GPU-orange?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Ubuntu-E95420?logo=ubuntu&logoColor=white)](https://github.com/pulkitmundra/nvr-command-center)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -44,7 +45,15 @@ Designed to stream **12+ concurrent cameras (`1 - 32` channels)** 24/7 with **`<
 
 ## Quick Start
 
-### 1. One-Command Install & Build
+### Option A: Install from Ubuntu App Center / Snap Store (Recommended)
+
+```bash
+sudo snap install nvr-command-center
+```
+
+On first launch, **NVR Command Center** automatically opens the built-in **Quick Setup Guide** in `Settings -> 1. NVR & Cameras` where you can enter your NVR LAN IP, Cloud P2P Serial Number (`SN`), username, and password directly from the GUI.
+
+### Option B: One-Command Source Install & Build
 
 ```bash
 git clone https://github.com/pulkitmundra/nvr-command-center.git
@@ -52,9 +61,9 @@ cd nvr-command-center
 ./install.sh
 ```
 
-### 2. Configure Your NVR / Cameras (`.env` or In-App GUI)
+### 2. Configure Your NVR / Cameras (In-App GUI or `.env`)
 
-Copy `.env.example` to `.env` (automatically secured with `chmod 600` and gitignored) or click **Settings** inside the app:
+Click **Settings** inside the app (saved with `0600` permissions), or copy `.env.example` to `.env`:
 
 ```bash
 cp .env.example .env
@@ -110,20 +119,23 @@ To bind a global Ubuntu/GNOME keyboard shortcut (e.g. `Ctrl+Alt+C` or `Super+C`)
 
 ---
 
-## Multi-Brand NVR Support
+## Multi-Brand NVR, DVR, XVR & IP Camera Support (Native Linux Alternative)
 
-- **Dahua / CP Plus / Amcrest (`RTSP_BRAND="dahua"`):**
-  `rtsp://{user}:{password}@{host}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}`
-- **Hikvision (`RTSP_BRAND="hikvision"`):**
-  `rtsp://{user}:{password}@{host}:{port}/Streaming/Channels/{channel}0{1|2}`
-- **Custom ONVIF / Tapo / Reolink (`RTSP_BRAND="custom"`):**
-  Configure any custom RTSP URL pattern via `RTSP_CUSTOM_URL_TEMPLATE` in `.env` or the Settings dialog.
+**NVR Command Center** serves as a fast, native Linux desktop replacement for proprietary Windows/Android CCTV & NVR surveillance clients:
+
+| Hardware Brand / Ecosystem | Proprietary Windows / Mobile Apps Replaced | Preset (`RTSP_BRAND`) & RTSP / Cloud P2P Support |
+| :--- | :--- | :--- |
+| **Dahua / IMOU / Lorex** | **SmartPSS** (`Smart PSS`), **DMSS** (`gDMSS` / `iDMSS`), **Easy4ip** (`Easy4ipCloud`), **Imou Life** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** (`rtsp://{user}:{password}@{host}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}`) |
+| **CP Plus (`CPPlus`)** | **KVMS Pro** (`KVMS`), **gCMOB**, **iCMOB**, **InstaOn**, **EzyKam** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** |
+| **Amcrest** | **Amcrest Surveillance Pro**, **Amcrest View Pro**, **Amcrest Cloud** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** |
+| **Hikvision / HiLook / EZVIZ** | **iVMS-4200** (`iVMS`), **Hik-Connect** (`HikConnect`), **SADP** | `RTSP_BRAND="hikvision"` (`rtsp://{user}:{password}@{host}:{port}/Streaming/Channels/{channel}0{1\|2}`) + LAN / Tailscale |
+| **Reolink / TP-Link Tapo & VIGI / Uniview (`UNV`) / Axis / Foscam / Ubiquiti UniFi / ONVIF** | Reolink Client, EZView, UNV Guard, Frigate, ZoneMinder, Shinobi, Blue Iris, Agent DVR | `RTSP_BRAND="custom"` via custom `RTSP_CUSTOM_URL_TEMPLATE` (`H.265` / `HEVC` & `H.264`) |
 
 ---
 
 ## Support the Project
 
-If **RTSP Camera Viewer** helps power your home lab, office security wall, or NVR setup, consider supporting ongoing development:
+If **NVR Command Center** helps power your home lab, office security wall, or NVR setup, consider supporting ongoing development:
 
 - **Buy Me a Coffee:** [https://buymeacoffee.com/pulkitmundra](https://buymeacoffee.com/pulkitmundra)
 - **GitHub Sponsors:** [https://github.com/sponsors/pulkitmundra](https://github.com/sponsors/pulkitmundra)

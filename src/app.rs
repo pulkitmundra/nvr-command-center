@@ -108,10 +108,19 @@ impl CameraViewerApp {
 
         let mut p2p_mgr = P2PTunnelManager::new();
         let mut initial_toast = None;
+        let is_unconfigured = env_cfg.password.trim().is_empty();
 
-        // Auto-detect if local LAN NVR is unreachable when on a different internet connection
-        if !env_cfg.p2p_serial.trim().is_empty() && !env_cfg.use_tailscale {
-            if !env_cfg.use_cloud_p2p && !is_lan_reachable(&env_cfg.host, env_cfg.port, 500) {
+        // Auto-detect whether local LAN NVR is reachable or away on another internet connection
+        if !is_unconfigured && !env_cfg.p2p_serial.trim().is_empty() && !env_cfg.use_tailscale {
+            if is_lan_reachable(&env_cfg.host, env_cfg.port, 500) {
+                if env_cfg.use_cloud_p2p {
+                    env_cfg.use_cloud_p2p = false;
+                    initial_toast = Some((
+                        "Local LAN NVR detected -> Switched to Direct LAN".to_string(),
+                        Instant::now(),
+                    ));
+                }
+            } else if !env_cfg.use_cloud_p2p {
                 env_cfg.use_cloud_p2p = true;
                 initial_toast = Some((
                     "Local LAN NVR unreachable -> Auto-switched to Cloud P2P Tunnel".to_string(),
@@ -120,7 +129,7 @@ impl CameraViewerApp {
             }
         }
 
-        if env_cfg.use_cloud_p2p && !env_cfg.p2p_serial.trim().is_empty() {
+        if !is_unconfigured && env_cfg.use_cloud_p2p && !env_cfg.p2p_serial.trim().is_empty() {
             let local_port = p2p_mgr.ensure_started(
                 &env_cfg.p2p_serial,
                 &env_cfg.username,
@@ -131,8 +140,10 @@ impl CameraViewerApp {
         }
 
         let app_cfg = AppConfig::load_and_sync(&env_cfg);
-        let mut stream_mgr = StreamManager::new(env_cfg.clone());
-        stream_mgr.start_streams(app_cfg.num_cameras);
+        let mut stream_mgr = StreamManager::new(env_cfg.clone(), p2p_mgr.is_connected_handle());
+        if !is_unconfigured {
+            stream_mgr.start_streams(app_cfg.num_cameras);
+        }
 
         let mut tiles = BTreeMap::new();
         for ch in 1..=app_cfg.num_cameras {
@@ -151,7 +162,7 @@ impl CameraViewerApp {
             all_paused: false,
             patrol_active: false,
             last_patrol_switch: Instant::now(),
-            show_settings: false,
+            show_settings: is_unconfigured,
             settings_tab: SettingsTab::NvrAndCameras,
             show_password: false,
             rename_modal_channel: None,
@@ -1182,6 +1193,29 @@ impl CameraViewerApp {
 
                 match self.settings_tab {
                     SettingsTab::NvrAndCameras => {
+                        egui::Frame::none()
+                            .fill(Color32::from_rgb(22, 31, 48))
+                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(56, 189, 248).gamma_multiply(0.45)))
+                            .rounding(Rounding::same(6.0))
+                            .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Quick Setup Guide:")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(Color32::from_rgb(56, 189, 248)),
+                                );
+                                ui.label(
+                                    RichText::new(
+                                        "- LAN Host / IP: Found on your NVR monitor under Menu -> Network -> TCP/IP (e.g. 192.168.1.108)\n\
+                                         - Cloud P2P Serial (Optional): Found under Menu -> Network -> P2P (Status: Online) or NVR S/N sticker for viewing on any internet connection without port forwarding.",
+                                    )
+                                    .size(11.5)
+                                    .color(Color32::from_rgb(203, 213, 225)),
+                                );
+                            });
+                        ui.add_space(6.0);
+
                         egui::Grid::new("nvr_settings_grid")
                             .num_columns(2)
                             .spacing([12.0, 8.0])
@@ -1213,12 +1247,18 @@ impl CameraViewerApp {
                                 ui.end_row();
 
                                 ui.label("Primary LAN Host / IP:");
-                                ui.text_edit_singleline(&mut self.edit_env_cfg.host);
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.edit_env_cfg.host)
+                                        .hint_text("e.g. 192.168.1.108"),
+                                );
                                 ui.end_row();
 
                                 ui.label("Cloud P2P Serial (Any Internet):");
                                 ui.horizontal(|ui| {
-                                    ui.text_edit_singleline(&mut self.edit_env_cfg.p2p_serial);
+                                    ui.add(
+                                        egui::TextEdit::singleline(&mut self.edit_env_cfg.p2p_serial)
+                                            .hint_text("Optional NVR S/N (e.g. 9H0E...)"),
+                                    );
                                     if ui
                                         .checkbox(
                                             &mut self.edit_env_cfg.use_cloud_p2p,

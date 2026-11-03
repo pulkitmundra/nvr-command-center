@@ -1,0 +1,123 @@
+name: nvr-command-center
+title: NVR Command Center (RTSP & CCTV Viewer)
+version: 2.1.0
+license: MIT
+website: https://github.com/pulkitmundra/nvr-command-center
+source-code: https://github.com/pulkitmundra/nvr-command-center
+issues: https://github.com/pulkitmundra/nvr-command-center/issues
+contact: https://github.com/pulkitmundra/nvr-command-center/issues
+summary: GPU RTSP IP Camera, CCTV, NVR/DVR/XVR & Cloud P2P Viewer (Dahua, Hikvision)
+description: |
+  NVR Command Center is an ultra-low-latency, GPU-accelerated multi-camera
+  RTSP IP Camera, CCTV, NVR, DVR, and XVR surveillance video wall and monitor
+  for Linux and Ubuntu, built in Native Rust (eframe/egui + OpenGL) with
+  zero-probe FFmpeg workers and built-in Cloud P2P remote tunneling.
+
+  Stream 1 to 32 concurrent security cameras 24/7 with < 0.9s parallel startup,
+  < 80ms glass-to-glass live latency, zero stream drift, and ~65-110 MB RAM on
+  both local LAN and any remote internet connection.
+
+  Native Linux Alternative for CCTV & NVR Client Apps:
+  * Dahua: SmartPSS (Smart PSS), DMSS (gDMSS / iDMSS), Easy4ip (Easy4ipCloud)
+  * CP Plus (CPPlus): KVMS Pro (KVMS), gCMOB, iCMOB, InstaOn, EzyKam
+  * Hikvision & HiLook: iVMS-4200 (iVMS), Hik-Connect (HikConnect)
+  * Amcrest: Amcrest Surveillance Pro, Amcrest View Pro, Amcrest Cloud
+  * Reolink, Lorex, IMOU (Imou Life), TP-Link Tapo & VIGI, Uniview (UNV / EZView),
+    EZVIZ, Axis, Foscam, Ubiquiti UniFi Protect, ONVIF IP cameras, and RTSP feeds
+    from Frigate, ZoneMinder, Shinobi, Agent DVR, Blue Iris, or Home Assistant.
+
+  Key Architecture & Features:
+  * Zero-Lag Kernel Pipe Burst Drain (ioctl FIONREAD) keeps 0 buffered frames
+    for < 80ms real-time glass-to-glass latency with zero inter-camera drift
+  * Built-in Cloud P2P Remote Access (Easy4ip / InstaOn / P2P Serial Number):
+    view your NVR/DVR/XVR cameras from any outside Wi-Fi or mobile hotspot with
+    zero router port forwarding and zero extra home hardware
+  * Automatic LAN <-> Cloud P2P & Tailscale detection and 1-click Top Bar switch
+  * Instant < 0.9s parallel multi-camera startup (H.265 / HEVC & H.264)
+  * GPU OpenGL UV shader digital zoom (1.0x - 5.0x) and click-drag pan at 0% CPU
+  * Per-camera [SD]/[HD] stream quality toggle and [Single]/[Grid] view buttons
+  * 4.5-second frozen-socket watchdog for 24/7 unattended video wall stability
+  * Patrol Mode auto-rotation, 12-camera composite wall PNG snapshots, and
+    in-app GUI Settings with first-launch Quick Setup wizard
+
+  Search Keywords:
+  rtsp, rtsp viewer, rtsp player, rtsp client, cctv, cctv viewer, cctv monitor,
+  ip camera, ip camera viewer, network camera, security camera, surveillance,
+  video wall, camera monitor, nvr, nvr viewer, nvr client, dvr, xvr, onvif,
+  h265, hevc, h264, dahua, smartpss, smart pss, dmss, gdmss, easy4ip,
+  easy4ipcloud, cp plus, cpplus, kvms, kvms pro, gcmob, instaon, hikvision,
+  ivms, ivms-4200, hik-connect, amcrest, reolink, lorex, imou, tapo, uniview,
+  unv, ezviz, p2p, cloud p2p, tailscale, webcam.
+
+  Support the Project:
+  * Buy Me a Coffee: https://buymeacoffee.com/pulkitmundra
+  * GitHub Sponsors: https://github.com/sponsors/pulkitmundra
+
+base: core24
+grade: stable
+confinement: strict
+compression: lzo
+
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+
+apps:
+  nvr-command-center:
+    command: bin/nvr-command-center
+    desktop: snap/gui/nvr-command-center.desktop
+    plugs:
+      - network
+      - network-bind
+      - audio-playback
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - opengl
+      - home
+
+parts:
+  nvr-command-center:
+    plugin: rust
+    source: .
+    build-packages:
+      - pkg-config
+    stage-packages:
+      - ffmpeg
+      - libgl1
+      - libegl1
+      - libglx0
+      - libopengl0
+      - libgles2
+      - libdrm2
+      - libgbm1
+      - libx11-6
+      - libx11-xcb1
+      - libxcb1
+      - libxcursor1
+      - libxrandr2
+      - libxi6
+      - libxext6
+      - libxfixes3
+      - libxrender1
+      - libxinerama1
+      - libxkbcommon0
+      - libxkbcommon-x11-0
+      - libwayland-client0
+      - libwayland-cursor0
+      - libwayland-egl1
+      - ca-certificates
+    override-build: |
+      craftctl default
+      mkdir -p "$CRAFT_PART_INSTALL/bin" "$CRAFT_PART_INSTALL/meta/gui"
+      cp "$CRAFT_PART_SRC/assets/icon.png" "$CRAFT_PART_INSTALL/meta/gui/icon.png"
+      cp "$CRAFT_PART_SRC/snap/gui/nvr-command-center.desktop" "$CRAFT_PART_INSTALL/meta/gui/nvr-command-center.desktop"
+      cat << 'EOF' > "$CRAFT_PART_INSTALL/bin/nvr-command-center"
+      #!/bin/sh
+      export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
+      export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+      exec "$SNAP/bin/rtsp-camera-viewer" "$@"
+      EOF
+      chmod 0755 "$CRAFT_PART_INSTALL/bin/nvr-command-center"

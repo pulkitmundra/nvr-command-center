@@ -2,11 +2,12 @@
 Version=1.0
 Type=Application
 Name=NVR Command Center
-Comment=Ultra-low-latency GPU multi-camera NVR & Cloud P2P command center
+GenericName=RTSP IP Camera, CCTV & NVR Viewer
+Comment=Ultra-low-latency GPU RTSP IP Camera, CCTV, NVR/DVR/XVR & Cloud P2P Surveillance Viewer (Dahua, CP Plus, Hikvision, Amcrest, ONVIF)
 Exec=rtsp-camera-viewer
 Icon=rtsp-camera-viewer
 Terminal=false
-Categories=Video;AudioVideo;
-Keywords=camera;rtsp;nvr;p2p;surveillance;video;rust;
+Categories=AudioVideo;Video;Player;TV;Network;
+Keywords=rtsp;rtsp viewer;rtsp player;rtsp client;cctv;cctv viewer;cctv monitor;ip camera;ip camera viewer;network camera;security camera;surveillance;video wall;camera monitor;nvr;nvr viewer;nvr client;dvr;xvr;onvif;h265;hevc;h264;dahua;smartpss;smart pss;dmss;gdmss;easy4ip;easy4ipcloud;cp plus;cpplus;kvms;kvms pro;gcmob;instaon;hikvision;ivms;ivms-4200;hik-connect;amcrest;reolink;lorex;imou;tapo;uniview;unv;ezviz;p2p;cloud p2p;tailscale;webcam;
 StartupNotify=true
 StartupWMClass=rtsp-camera-viewer

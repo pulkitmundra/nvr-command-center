@@ -170,6 +170,7 @@ fn pipe_available_bytes(fd: i32) -> usize {
 
 pub struct StreamManager {
     env_cfg: Arc<RwLock<NvrEnvConfig>>,
+    p2p_ready: Arc<AtomicBool>,
     slots: BTreeMap<usize, Arc<FrameSlot>>,
     workers: Vec<JoinHandle<()>>,
     watchdog_stop: Arc<AtomicBool>,
@@ -177,10 +178,11 @@ pub struct StreamManager {
 }
 
 impl StreamManager {
-    pub fn new(env_cfg: NvrEnvConfig) -> Self {
+    pub fn new(env_cfg: NvrEnvConfig, p2p_ready: Arc<AtomicBool>) -> Self {
         let shared_env = Arc::new(RwLock::new(env_cfg));
         Self {
             env_cfg: shared_env,
+            p2p_ready,
             slots: BTreeMap::new(),
             workers: Vec::new(),
             watchdog_stop: Arc::new(AtomicBool::new(false)),
@@ -215,21 +217,24 @@ impl StreamManager {
         for ch in launch_order {
             if let Some(slot) = self.slots.get(&ch).cloned() {
                 let env_ref = Arc::clone(&self.env_cfg);
+                let p2p_ready_ref = Arc::clone(&self.p2p_ready);
                 let handle = thread::Builder::new()
                     .name(format!("rtsp-cam-{}", ch))
-                    .spawn(move || camera_worker_loop(slot, env_ref))
+                    .spawn(move || camera_worker_loop(slot, env_ref, p2p_ready_ref))
                     .expect("Failed to spawn camera worker thread");
                 self.workers.push(handle);
             }
         }
 
-        // Spawn lightweight 4.5s socket stall watchdog thread
+        // Spawn lightweight socket stall watchdog thread
         let slots_vec: Vec<Arc<FrameSlot>> = self.slots.values().cloned().collect();
         let wd_stop = Arc::clone(&self.watchdog_stop);
+        let wd_env = Arc::clone(&self.env_cfg);
+        let wd_p2p = Arc::clone(&self.p2p_ready);
         self.watchdog_handle = Some(
             thread::Builder::new()
                 .name("rtsp-watchdog".to_string())
-                .spawn(move || watchdog_loop(slots_vec, wd_stop))
+                .spawn(move || watchdog_loop(slots_vec, wd_stop, wd_env, wd_p2p))
                 .expect("Failed to spawn watchdog thread"),
         );
     }
@@ -316,12 +321,27 @@ impl Drop for StreamManager {
     }
 }
 
-fn watchdog_loop(slots: Vec<Arc<FrameSlot>>, stop_flag: Arc<AtomicBool>) {
+fn watchdog_loop(
+    slots: Vec<Arc<FrameSlot>>,
+    stop_flag: Arc<AtomicBool>,
+    env_cfg: Arc<RwLock<NvrEnvConfig>>,
+    p2p_ready: Arc<AtomicBool>,
+) {
     while !stop_flag.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(500));
         if stop_flag.load(Ordering::Acquire) {
             break;
         }
+        let is_cloud = env_cfg
+            .read()
+            .map(|c| c.use_cloud_p2p && !c.p2p_serial.trim().is_empty())
+            .unwrap_or(false);
+        if is_cloud && !p2p_ready.load(Ordering::Acquire) {
+            continue;
+        }
+        let live_stall_ms = if is_cloud { 12000 } else { 4500 };
+        let connect_timeout_ms = if is_cloud { 22000 } else { 7500 };
+
         let now = now_epoch_ms();
         for slot in &slots {
             if slot.paused.load(Ordering::Acquire) || slot.stop_flag.load(Ordering::Acquire) {
@@ -335,21 +355,23 @@ fn watchdog_loop(slots: Vec<Arc<FrameSlot>>, stop_flag: Arc<AtomicBool>) {
             let last_frame = slot.last_frame_epoch_ms.load(Ordering::Acquire);
             let conn_start = slot.connect_start_epoch_ms.load(Ordering::Acquire);
 
-            if st == StreamStatus::Live && last_frame > 0 && now.saturating_sub(last_frame) > 4500 {
-                // Stream stalled mid-connection for > 4.5s -> kill hung socket to trigger instant reconnect
+            if st == StreamStatus::Live && last_frame > 0 && now.saturating_sub(last_frame) > live_stall_ms {
                 slot.kill_active_child();
             } else if (st == StreamStatus::Connecting || st == StreamStatus::Reconnecting)
                 && conn_start > 0
-                && now.saturating_sub(conn_start) > 7500
+                && now.saturating_sub(conn_start) > connect_timeout_ms
             {
-                // Initial handshake hung for > 7.5s -> kill and retry
                 slot.kill_active_child();
             }
         }
     }
 }
 
-fn camera_worker_loop(slot: Arc<FrameSlot>, env_cfg: Arc<RwLock<NvrEnvConfig>>) {
+fn camera_worker_loop(
+    slot: Arc<FrameSlot>,
+    env_cfg: Arc<RwLock<NvrEnvConfig>>,
+    p2p_ready: Arc<AtomicBool>,
+) {
     let mut back_buf: Vec<u8> = Vec::new();
     let mut consecutive_failures: u32 = 0;
 
@@ -371,6 +393,29 @@ fn camera_worker_loop(slot: Arc<FrameSlot>, env_cfg: Arc<RwLock<NvrEnvConfig>>) 
         }
 
         let cfg_snapshot = env_cfg.read().unwrap().clone();
+        if cfg_snapshot.use_cloud_p2p && !cfg_snapshot.p2p_serial.trim().is_empty() {
+            if !p2p_ready.load(Ordering::Acquire) {
+                if slot.frame_seq.load(Ordering::Acquire) == 0 {
+                    slot.set_status(StreamStatus::Connecting);
+                } else {
+                    slot.set_status(StreamStatus::Reconnecting);
+                }
+                thread::sleep(Duration::from_millis(120));
+                continue;
+            }
+            if slot.frame_seq.load(Ordering::Acquire) == 0 && consecutive_failures == 0 {
+                // Launch IP cameras (channel >= ip_camera_start_channel) first with minimal stagger
+                // so their RTSP handshakes complete before BNC video streams saturate the relay
+                let stagger_ms = if slot.channel >= cfg_snapshot.ip_camera_start_channel {
+                    (slot.channel.saturating_sub(cfg_snapshot.ip_camera_start_channel) as u64) * 25
+                } else {
+                    90 + (slot.channel.saturating_sub(1) as u64) * 25
+                };
+                if stagger_ms > 0 {
+                    thread::sleep(Duration::from_millis(stagger_ms));
+                }
+            }
+        }
         let rtsp_url = cfg_snapshot.build_rtsp_url(slot.channel, subtype);
 
         slot.connect_start_epoch_ms
@@ -382,7 +427,8 @@ fn camera_worker_loop(slot: Arc<FrameSlot>, env_cfg: Arc<RwLock<NvrEnvConfig>>) 
             slot.set_status(StreamStatus::Reconnecting);
         }
 
-        // SD uses 32KB / 0us probe for sub-second lock; HD uses 500KB / 500ms so 720p/1080p keyframes always parse
+        // SD uses 32KB / 0us / fpsprobesize 0 so streams (including IP cams with silent pcm_alaw tracks)
+        // never block waiting on audio packets; HD uses 500KB / 500ms.
         let (probe_size, analyze_dur) = if subtype == 0 {
             ("500000", "500000")
         } else {
@@ -408,7 +454,9 @@ fn camera_worker_loop(slot: Arc<FrameSlot>, env_cfg: Arc<RwLock<NvrEnvConfig>>) 
             .arg("-max_delay")
             .arg("0");
 
-        if cfg_snapshot.hwaccel_mode.eq_ignore_ascii_case("auto") {
+        // Consumer NVIDIA GPUs cap concurrent NVDEC sessions at 8; use hwaccel on HD main-stream,
+        // while 12+ SD sub-streams decode in <1ms via CPU SIMD without hitting the 8-session NVDEC limit.
+        if cfg_snapshot.hwaccel_mode.eq_ignore_ascii_case("auto") && subtype == 0 {
             cmd.arg("-hwaccel").arg("auto");
         }
 

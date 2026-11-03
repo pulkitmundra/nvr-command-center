@@ -35,12 +35,32 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
+        let (screenshot_dir, recording_dir) = if let Ok(real_home) = std::env::var("SNAP_REAL_HOME")
+        {
+            if !real_home.trim().is_empty() {
+                (
+                    format!("{}/Pictures/NVR-Snapshots", real_home.trim()),
+                    format!("{}/Videos/NVR-Recordings", real_home.trim()),
+                )
+            } else {
+                (
+                    "~/rtsp_viewer/screenshots".to_string(),
+                    "~/rtsp_viewer/recordings".to_string(),
+                )
+            }
+        } else {
+            (
+                "~/rtsp_viewer/screenshots".to_string(),
+                "~/rtsp_viewer/recordings".to_string(),
+            )
+        };
+
         Self {
             layout: GridLayoutConfig { rows: 3, cols: 4 },
             layout_mode: "3x4".to_string(),
             num_cameras: 12,
-            screenshot_dir: "~/rtsp_viewer/screenshots".to_string(),
-            recording_dir: "~/rtsp_viewer/recordings".to_string(),
+            screenshot_dir,
+            recording_dir,
             fps_limit: 15,
             reconnect_interval: 3,
             connection_timeout: 5,
@@ -187,6 +207,11 @@ pub fn expand_tilde(path: &str) -> PathBuf {
 }
 
 pub fn config_file_path() -> PathBuf {
+    if let Ok(snap_common) = std::env::var("SNAP_USER_COMMON") {
+        if !snap_common.trim().is_empty() {
+            return PathBuf::from(snap_common.trim()).join("config.json");
+        }
+    }
     expand_tilde("~/.rtsp_viewer/config.json")
 }
 
@@ -211,9 +236,21 @@ pub fn locate_env_file() -> PathBuf {
             }
         }
     }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".env")
+    if let Ok(snap_common) = std::env::var("SNAP_USER_COMMON") {
+        if !snap_common.trim().is_empty() {
+            return PathBuf::from(snap_common.trim()).join(".env");
+        }
+    }
+    let user_env = expand_tilde("~/.rtsp_viewer/.env");
+    if user_env.exists() {
+        return user_env;
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        if !cwd.starts_with("/snap") && !cwd.starts_with("/usr") && cwd != Path::new("/") {
+            return cwd.join(".env");
+        }
+    }
+    user_env
 }
 
 pub fn escape_env_val(val: &str) -> String {
@@ -332,6 +369,12 @@ pub fn load_env_config(path: &Path) -> NvrEnvConfig {
 pub fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
+
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fs::create_dir_all(parent);
+        }
+    }
 
     let mut file = fs::OpenOptions::new()
         .write(true)

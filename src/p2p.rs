@@ -11,8 +11,9 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::ErrorKind,
     net::{TcpStream, ToSocketAddrs},
+    os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -20,7 +21,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, Semaphore},
     time,
 };
 use xml::reader::{EventReader, XmlEvent};
@@ -50,10 +51,28 @@ pub fn is_lan_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(timeout_ms)).is_ok()
 }
 
+fn is_tcp_established(stream: &tokio::net::TcpStream) -> bool {
+    let fd = stream.as_raw_fd();
+    let mut info: libc::tcp_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_info>() as libc::socklen_t;
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_TCP,
+            libc::TCP_INFO,
+            &mut info as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    // Linux TCP_ESTABLISHED == 1; sockets whose peer already closed are TCP_CLOSE_WAIT (8)
+    rc == 0 && info.tcpi_state == 1
+}
+
 pub struct P2PTunnelManager {
     active_key: String,
     local_port: u16,
     stop_flag: Option<Arc<AtomicBool>>,
+    connected: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 }
 
@@ -69,8 +88,13 @@ impl P2PTunnelManager {
             active_key: String::new(),
             local_port: DEFAULT_LOCAL_PORT,
             stop_flag: None,
+            connected: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new("Idle".to_string())),
         }
+    }
+
+    pub fn is_connected_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.connected)
     }
 
     pub fn status_text(&self) -> String {
@@ -84,6 +108,7 @@ impl P2PTunnelManager {
         if let Some(flag) = self.stop_flag.take() {
             flag.store(true, Ordering::SeqCst);
         }
+        self.connected.store(false, Ordering::Release);
         self.active_key.clear();
         if let Ok(mut s) = self.status.lock() {
             *s = "Stopped".to_string();
@@ -110,6 +135,7 @@ impl P2PTunnelManager {
 
         self.stop();
         self.active_key = key;
+        self.connected.store(false, Ordering::Release);
 
         // Bind a persistent local port (prefer 15540, fallback to OS-assigned)
         let std_listener = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_LOCAL_PORT))
@@ -124,6 +150,7 @@ impl P2PTunnelManager {
         let stop_flag = Arc::new(AtomicBool::new(false));
         self.stop_flag = Some(stop_flag.clone());
 
+        let connected_flag = self.connected.clone();
         let status = self.status.clone();
         if let Ok(mut s) = status.lock() {
             *s = "Cloud P2P Connecting...".to_string();
@@ -148,6 +175,7 @@ impl P2PTunnelManager {
                     let listener = Arc::new(listener);
 
                     while !stop_flag.load(Ordering::SeqCst) {
+                        connected_flag.store(false, Ordering::Release);
                         if let Ok(mut s) = status.lock() {
                             *s = "Cloud P2P Handshake...".to_string();
                         }
@@ -159,12 +187,14 @@ impl P2PTunnelManager {
                             &pass_owned,
                             remote_port,
                             stop_flag.clone(),
+                            connected_flag.clone(),
                             status.clone(),
                         )
                         .await
                         {
                             Ok(()) => break,
                             Err(e) => {
+                                connected_flag.store(false, Ordering::Release);
                                 if stop_flag.load(Ordering::SeqCst) {
                                     break;
                                 }
@@ -175,6 +205,7 @@ impl P2PTunnelManager {
                             }
                         }
                     }
+                    connected_flag.store(false, Ordering::Release);
                 });
             })
             .ok();
@@ -196,6 +227,7 @@ async fn run_tunnel_session(
     password: &str,
     remote_port: u16,
     stop_flag: Arc<AtomicBool>,
+    connected_flag: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 ) -> Result<(), String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
@@ -209,6 +241,16 @@ async fn run_tunnel_session(
     .await
     .map_err(|_| "Handshake timeout".to_string())??;
 
+    // Drain any stale CLOSE-WAIT sockets queued before the handshake finished
+    while let Ok(Ok((stale_client, _))) =
+        time::timeout(Duration::from_millis(5), listener.accept()).await
+    {
+        if is_tcp_established(&stale_client) {
+            drop(stale_client);
+        }
+    }
+
+    connected_flag.store(true, Ordering::Release);
     if let Ok(mut s) = status.lock() {
         *s = "Cloud P2P Connected".to_string();
     }
@@ -257,8 +299,14 @@ async fn run_tunnel_session(
         res
     });
 
+    // Serialize PTCP Bind handshakes 1 at a time so multi-camera startup
+    // never interleaves Bind sequence numbers over the UDP relay
+    let bind_semaphore = Arc::new(Semaphore::new(1));
+    let consecutive_bind_failures = Arc::new(AtomicU32::new(0));
+
     loop {
         if stop_flag.load(Ordering::SeqCst) {
+            connected_flag.store(false, Ordering::Release);
             writer_handle.abort();
             reader_handle.abort();
             if let Ok(mut map) = channels.lock() {
@@ -269,7 +317,10 @@ async fn run_tunnel_session(
             }
             return Ok(());
         }
-        if !session_alive.load(Ordering::SeqCst) {
+        if !session_alive.load(Ordering::SeqCst)
+            || consecutive_bind_failures.load(Ordering::Acquire) >= 12
+        {
+            connected_flag.store(false, Ordering::Release);
             writer_handle.abort();
             reader_handle.abort();
             if let Ok(mut map) = channels.lock() {
@@ -281,59 +332,88 @@ async fn run_tunnel_session(
             return Err("Relay session closed".to_string());
         }
 
-        let accept_res = time::timeout(Duration::from_millis(500), listener.accept()).await;
+        let accept_res = time::timeout(Duration::from_millis(300), listener.accept()).await;
         let Ok(Ok((client, _addr))) = accept_res else {
             continue;
         };
 
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
-        let (conn_tx, mut conn_rx) = oneshot::channel::<bool>();
-        let dh_tx_client = dh_tx.clone();
-
-        let realm_id = rand::random::<u32>();
-        if let Ok(mut map) = channels.lock() {
-            map.insert(realm_id, tx);
-        }
-        if let Ok(mut map) = conn_channels.lock() {
-            map.insert(realm_id, conn_tx);
-        }
-
-        let mut bound = false;
-        for _attempt in 0..3 {
-            if dh_tx_client
-                .send(PTCPEvent::Connect(realm_id))
-                .await
-                .is_err()
-            {
-                break;
-            }
-            match time::timeout(Duration::from_millis(1800), &mut conn_rx).await {
-                Ok(Ok(true)) => {
-                    bound = true;
-                    break;
-                }
-                Ok(_) => break,
-                Err(_) => continue,
-            }
-        }
-
-        if !bound {
-            if let Ok(mut map) = channels.lock() {
-                map.remove(&realm_id);
-            }
-            if let Ok(mut map) = conn_channels.lock() {
-                map.remove(&realm_id);
-            }
-            let _ = dh_tx_client.send(PTCPEvent::Disconnect(realm_id)).await;
+        // Immediately drop dead sockets from timed-out ffmpeg processes in 0ms
+        if !is_tcp_established(&client) {
             continue;
         }
 
-        let (reader, writer) = client.into_split();
+        let dh_tx_client = dh_tx.clone();
+        let channels_client = channels.clone();
+        let conn_channels_client = conn_channels.clone();
+        let sem_clone = bind_semaphore.clone();
+        let bind_failures = consecutive_bind_failures.clone();
+        let alive_flag = session_alive.clone();
+
         tokio::spawn(async move {
-            process_reader(reader, realm_id, dh_tx_client).await;
-        });
-        tokio::spawn(async move {
-            process_writer(writer, rx).await;
+            let Ok(_permit) = sem_clone.acquire_owned().await else {
+                return;
+            };
+            if !alive_flag.load(Ordering::SeqCst) || !is_tcp_established(&client) {
+                return;
+            }
+
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+            let (conn_tx, mut conn_rx) = oneshot::channel::<bool>();
+
+            let realm_id = rand::random::<u32>();
+            if let Ok(mut map) = channels_client.lock() {
+                map.insert(realm_id, tx);
+            }
+            if let Ok(mut map) = conn_channels_client.lock() {
+                map.insert(realm_id, conn_tx);
+            }
+
+            let mut bound = false;
+            for _attempt in 0..3 {
+                if !is_tcp_established(&client) {
+                    break;
+                }
+                if dh_tx_client
+                    .send(PTCPEvent::Connect(realm_id))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                match time::timeout(Duration::from_millis(2000), &mut conn_rx).await {
+                    Ok(Ok(true)) => {
+                        bound = true;
+                        break;
+                    }
+                    Ok(_) => break,
+                    Err(_) => continue,
+                }
+            }
+
+            if !bound {
+                if let Ok(mut map) = channels_client.lock() {
+                    map.remove(&realm_id);
+                }
+                if let Ok(mut map) = conn_channels_client.lock() {
+                    map.remove(&realm_id);
+                }
+                let _ = dh_tx_client.send(PTCPEvent::Disconnect(realm_id)).await;
+                if is_tcp_established(&client) {
+                    bind_failures.fetch_add(1, Ordering::AcqRel);
+                }
+                return;
+            }
+
+            bind_failures.store(0, Ordering::Release);
+            drop(_permit);
+
+            let (reader, writer) = client.into_split();
+            tokio::spawn(async move {
+                process_reader(reader, realm_id, dh_tx_client).await;
+            });
+            tokio::spawn(async move {
+                process_writer(writer, rx).await;
+            });
         });
     }
 }
@@ -440,7 +520,7 @@ async fn p2p_handshake(
         .map_err(|e| e.to_string())?;
 
     dh_request(&socket, "/probe/p2psrv", None, &mut cseq).await?;
-    dh_read(&socket).await?;
+    let _ = dh_read(&socket).await?;
 
     dh_request(
         &socket,
@@ -454,6 +534,15 @@ async fn p2p_handshake(
         .body
         .and_then(|b| b.get("body/US").cloned())
         .ok_or_else(|| "Missing US p2psrv".to_string())?;
+
+    // Pin signaling requests to the NVR's authoritative cluster node on port 8800
+    // so Geo-DNS round-robin differences on remote networks never misroute relay-channel
+    let cluster_host = p2psrv.split(':').next().unwrap_or("www.easy4ipcloud.com");
+    let cluster_main = format!("{}:8800", cluster_host);
+    socket
+        .connect(&cluster_main)
+        .await
+        .map_err(|e| e.to_string())?;
 
     let socket_info = UdpSocket::bind("0.0.0.0:0")
         .await
@@ -470,7 +559,7 @@ async fn p2p_handshake(
         &mut cseq,
     )
     .await?;
-    dh_read(&socket_info).await?;
+    let _ = dh_read(&socket_info).await?;
 
     dh_request(
         &socket_info,
@@ -550,7 +639,7 @@ async fn p2p_handshake(
         &mut cseq,
     )
     .await?;
-    dh_read(&socket2).await?;
+    let _ = dh_read(&socket2).await?;
 
     let mut res = dh_read_raw(&socket).await?;
     for _ in 0..4 {
@@ -571,7 +660,7 @@ async fn p2p_handshake(
         .unwrap_or_else(|| nonce_str.clone());
 
     socket2
-        .connect(MAIN_SERVER)
+        .connect(&cluster_main)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -586,14 +675,14 @@ async fn p2p_handshake(
     .await?;
 
     socket2.connect(&agent).await.map_err(|e| e.to_string())?;
-    let _ = time::timeout(Duration::from_secs(3), dh_read_raw(&socket2)).await;
+    let _ = time::timeout(Duration::from_secs(4), dh_read_raw(&socket2)).await;
 
     let mut session = PTCPSession::new();
     ptcp_request(&socket2, session.send(PTCPBody::Sync)).await?;
     let sync_pkt = time::timeout(Duration::from_secs(5), ptcp_read(&socket2))
         .await
         .map_err(|_| "Relay PTCP Sync timeout".to_string())??;
-    session.recv(sync_pkt);
+    session.recv_sync(sync_pkt);
 
     Ok((socket2, session))
 }
@@ -623,7 +712,9 @@ impl DHResponse {
                     let key = stack.as_slice().join("/");
                     tree.insert(key, s);
                 }
-                Ok(XmlEvent::EndDocument) | Err(_) => break,
+                Ok(XmlEvent::EndDocument) | Err(_) => {
+                    break;
+                }
                 _ => {}
             }
         }
@@ -632,25 +723,25 @@ impl DHResponse {
 
     fn parse_response(res: &str) -> Result<DHResponse, String> {
         let mut parts = res.split("\r\n\r\n");
-        let head = parts.next().ok_or_else(|| "Malformed DH response".to_string())?;
+        let head = parts.next().ok_or_else(|| "Empty DH response".to_string())?;
         let body = parts.next().unwrap_or("");
 
         let mut head_parts = head.split("\r\n");
-        let status_line = head_parts
+        let status_line_str = head_parts
             .next()
-            .ok_or_else(|| "Empty status line".to_string())?;
-        let mut status_tokens = status_line.split(' ');
-        let _version = status_tokens.next().unwrap_or("");
-        let code = status_tokens
+            .ok_or_else(|| "Missing status line".to_string())?;
+        let mut status_line = status_line_str.split(' ');
+        let _version = status_line.next().unwrap_or("");
+        let code = status_line
             .next()
             .and_then(|c| c.parse::<u16>().ok())
             .ok_or_else(|| "Invalid status code".to_string())?;
-        let status = status_tokens.collect::<Vec<_>>().join(" ");
+        let status = status_line.collect::<Vec<_>>().join(" ");
 
         let body_map = if body.trim().is_empty() {
             None
         } else {
-            Some(Self::parse_body(body))
+            Some(DHResponse::parse_body(body))
         };
 
         Ok(DHResponse {
@@ -667,8 +758,11 @@ async fn dh_request(
     body: Option<&str>,
     seq: &mut u32,
 ) -> Result<(), String> {
-    let method = if body.is_some() { "DHPOST" } else { "DHGET" };
-    let body_str = body.unwrap_or("");
+    let method = match body {
+        Some(_) => "DHPOST",
+        None => "DHGET",
+    };
+    let body = body.unwrap_or("");
 
     let nonce = rand::random::<u32>() & 0x7FFF_FFFF;
     let currdate = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
@@ -677,19 +771,19 @@ async fn dh_request(
     let mut hasher = sha1::Sha1::new();
     hasher.update(pwd);
     let hash_digest = hasher.finalize();
-    let digest = base64::engine::general_purpose::STANDARD.encode(hash_digest);
+    let digest = base64::engine::general_purpose::STANDARD.encode(&hash_digest);
 
     *seq += 1;
 
-    let content_headers = if !body_str.is_empty() {
-        format!("Content-Type: \r\nContent-Length: {}\r\n", body_str.len())
+    let content_headers = if !body.is_empty() {
+        format!("Content-Type: \r\nContent-Length: {}\r\n", body.len())
     } else {
         String::new()
     };
 
     let req = format!(
         "{} {} HTTP/1.1\r\nCSeq: {}\r\nAuthorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n{}\r\n{}",
-        method, path, seq, DHP2P_WSSE_ID, digest, nonce, currdate, content_headers, body_str
+        method, path, seq, DHP2P_WSSE_ID, digest, nonce, currdate, content_headers, body
     );
 
     socket
@@ -703,7 +797,7 @@ async fn dh_read_raw(socket: &UdpSocket) -> Result<DHResponse, String> {
     let mut buf = [0u8; 4096];
     let n = time::timeout(Duration::from_secs(5), socket.recv(&mut buf))
         .await
-        .map_err(|_| "UDP read timeout".to_string())?
+        .map_err(|_| "UDP signaling read timeout".to_string())?
         .map_err(|e| e.to_string())?;
     let res = String::from_utf8_lossy(&buf[0..n]);
     DHResponse::parse_response(&res)
@@ -712,13 +806,134 @@ async fn dh_read_raw(socket: &UdpSocket) -> Result<DHResponse, String> {
 async fn dh_read(socket: &UdpSocket) -> Result<DHResponse, String> {
     let res = dh_read_raw(socket).await?;
     if res.code >= 300 {
-        return Err(format!("Cloud HTTP {}: {}", res.code, res.status));
+        return Err(format!("Signaling HTTP {} ({})", res.code, res.status));
     }
     Ok(res)
 }
 
-fn sequence_is_after(candidate: u32, current: u32) -> bool {
-    candidate != current && candidate.wrapping_sub(current) < (1 << 31)
+pub enum PTCPEvent {
+    Heartbeat,
+    Connect(u32),
+    Disconnect(u32),
+    Data(u32, Vec<u8>),
+}
+
+#[derive(Clone)]
+pub struct PTCPPayload {
+    pub realm: u32,
+    pub data: Vec<u8>,
+}
+
+impl PTCPPayload {
+    fn parse(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 12 || data[0] != 0x10 {
+            return Err("Invalid PTCPPayload header".to_string());
+        }
+        let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let length = (header & 0xFFFF) as usize;
+        let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let end = cmp::min(12 + length, data.len());
+        let payload_data = data[12..end].to_vec();
+        Ok(Self {
+            realm,
+            data: payload_data,
+        })
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        let length = self.data.len() as u32;
+        let header = (0x10000000u32 | (length & 0xFFFF)).to_be_bytes();
+        let realm = self.realm.to_be_bytes();
+        let padding = 0u32.to_be_bytes();
+
+        [
+            header.to_vec(),
+            realm.to_vec(),
+            padding.to_vec(),
+            self.data.clone(),
+        ]
+        .concat()
+    }
+}
+
+pub enum PTCPBody {
+    Empty,
+    Sync,
+    Heartbeat,
+    Command(Vec<u8>),
+    Bind(u32, u32),
+    Status(u32, String),
+    Payload(PTCPPayload),
+}
+
+impl PTCPBody {
+    fn parse(data: &[u8]) -> Result<Self, String> {
+        if data.len() < 4 {
+            return Ok(Self::Empty);
+        }
+        match data[0] {
+            0x00 => Ok(Self::Sync),
+            0x10 => Ok(Self::Payload(PTCPPayload::parse(data)?)),
+            0x11 if data.len() >= 16 => Ok(Self::Bind(
+                u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
+                u32::from_be_bytes([data[12], data[13], data[14], data[15]]),
+            )),
+            0x12 if data.len() >= 12 => {
+                let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+                let status = String::from_utf8_lossy(&data[12..]).to_string();
+                Ok(Self::Status(realm, status))
+            }
+            0x13 => Ok(Self::Heartbeat),
+            _ => Ok(Self::Command(data.to_vec())),
+        }
+    }
+
+    fn serialize(&self) -> Vec<u8> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Sync => b"\x00\x03\x01\x00".to_vec(),
+            Self::Command(data) => data.clone(),
+            Self::Payload(payload) => payload.serialize(),
+            Self::Bind(realm, port) => [
+                b"\x11\x00\x00\x00".to_vec(),
+                realm.to_be_bytes().to_vec(),
+                b"\x00\x00\x00\x00".to_vec(),
+                port.to_be_bytes().to_vec(),
+                b"\x7f\x00\x00\x01".to_vec(),
+            ]
+            .concat(),
+            Self::Status(realm, status) => [
+                b"\x12\x00\x00\x00".to_vec(),
+                realm.to_be_bytes().to_vec(),
+                b"\x00\x00\x00\x00".to_vec(),
+                status.as_bytes().to_vec(),
+            ]
+            .concat(),
+            Self::Heartbeat => b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Sync => 4,
+            Self::Command(data) => data.len(),
+            Self::Payload(payload) => payload.data.len() + 12,
+            Self::Bind(_, _) => 20,
+            Self::Status(_, status) => status.len() + 12,
+            Self::Heartbeat => 12,
+            Self::Empty => 0,
+        }
+    }
+}
+
+pub struct PTCPPacket {
+    sent: u32,
+    recv: u32,
+    pid: u32,
+    lmid: u32,
+    rmid: u32,
+    body: PTCPBody,
+    duplicate: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -730,143 +945,23 @@ struct PacketIdentity {
     body_hash: u64,
 }
 
-enum PTCPEvent {
-    Heartbeat,
-    Connect(u32),
-    Disconnect(u32),
-    Data(u32, Vec<u8>),
-}
-
-struct PTCPPayload {
-    realm: u32,
-    data: Vec<u8>,
-}
-
-enum PTCPBody {
-    Sync,
-    Command(Vec<u8>),
-    Payload(PTCPPayload),
-    Bind(u32, u32),
-    Status(u32, String),
-    Heartbeat,
-    Empty,
-}
-
-struct PTCPPacket {
-    sent: u32,
-    recv: u32,
-    pid: u32,
-    lmid: u32,
-    rmid: u32,
-    body: PTCPBody,
-    duplicate: bool,
-}
-
-impl PTCPPayload {
-    fn parse(data: &[u8]) -> Option<PTCPPayload> {
-        if data.len() < 12 || data[0] != 0x10 {
-            return None;
-        }
-        let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
-        let length = (header & 0xFFFF) as usize;
-        let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let end = cmp::min(12 + length, data.len());
-        Some(PTCPPayload {
-            realm,
-            data: data[12..end].to_vec(),
-        })
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        let length = self.data.len() as u32;
-        let header = (0x10000000 | length).to_be_bytes();
-        let realm = self.realm.to_be_bytes();
-        let padding = 0u32.to_be_bytes();
-        [
-            header.to_vec(),
-            realm.to_vec(),
-            padding.to_vec(),
-            self.data.clone(),
-        ]
-        .concat()
-    }
-}
-
-impl PTCPBody {
-    fn parse(data: &[u8]) -> PTCPBody {
-        if data.len() < 4 {
-            return PTCPBody::Empty;
-        }
-        match data[0] {
-            0x00 => PTCPBody::Sync,
-            0x10 => PTCPPayload::parse(data)
-                .map(PTCPBody::Payload)
-                .unwrap_or(PTCPBody::Empty),
-            0x11 if data.len() >= 16 => PTCPBody::Bind(
-                u32::from_be_bytes([data[4], data[5], data[6], data[7]]),
-                u32::from_be_bytes([data[12], data[13], data[14], data[15]]),
-            ),
-            0x12 if data.len() >= 12 => {
-                let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-                let status = String::from_utf8_lossy(&data[12..]).to_string();
-                PTCPBody::Status(realm, status)
-            }
-            0x13 => PTCPBody::Heartbeat,
-            _ => PTCPBody::Command(data.to_vec()),
-        }
-    }
-
-    fn serialize(&self) -> Vec<u8> {
-        match self {
-            PTCPBody::Sync => b"\x00\x03\x01\x00".to_vec(),
-            PTCPBody::Command(data) => data.to_vec(),
-            PTCPBody::Payload(payload) => payload.serialize(),
-            PTCPBody::Bind(realm, port) => [
-                b"\x11\x00\x00\x00".to_vec(),
-                realm.to_be_bytes().to_vec(),
-                b"\x00\x00\x00\x00".to_vec(),
-                port.to_be_bytes().to_vec(),
-                b"\x7f\x00\x00\x01".to_vec(),
-            ]
-            .concat(),
-            PTCPBody::Status(realm, status) => [
-                b"\x12\x00\x00\x00".to_vec(),
-                realm.to_be_bytes().to_vec(),
-                b"\x00\x00\x00\x00".to_vec(),
-                status.as_bytes().to_vec(),
-            ]
-            .concat(),
-            PTCPBody::Heartbeat => b"\x13\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".to_vec(),
-            PTCPBody::Empty => Vec::new(),
-        }
-    }
-
-    fn len(&self) -> usize {
-        match self {
-            PTCPBody::Sync => 4,
-            PTCPBody::Command(data) => data.len(),
-            PTCPBody::Payload(payload) => payload.data.len() + 12,
-            PTCPBody::Bind(_, _) => 20,
-            PTCPBody::Status(_, status) => status.len() + 12,
-            PTCPBody::Heartbeat => 12,
-            PTCPBody::Empty => 0,
-        }
-    }
+fn sequence_is_after(candidate: u32, baseline: u32) -> bool {
+    candidate != baseline && candidate.wrapping_sub(baseline) < 0x8000_0000
 }
 
 impl PTCPPacket {
-    fn parse(data: &[u8]) -> Result<PTCPPacket, String> {
-        if data.len() < 24 || &data[0..4] != b"PTCP" {
-            return Err("Invalid PTCP packet header".to_string());
+    fn parse(raw: &[u8]) -> Result<Self, String> {
+        if raw.len() < 24 || &raw[0..4] != b"PTCP" {
+            return Err("Invalid PTCP magic".to_string());
         }
-        let sent = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let recv = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
-        let pid = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
-        let lmid = u32::from_be_bytes([data[16], data[17], data[18], data[19]]);
-        let rmid = u32::from_be_bytes([data[20], data[21], data[22], data[23]]);
-        let body = PTCPBody::parse(&data[24..]);
+        let sent = u32::from_be_bytes(raw[4..8].try_into().unwrap());
+        let recv = u32::from_be_bytes(raw[8..12].try_into().unwrap());
+        let pid = u32::from_be_bytes(raw[12..16].try_into().unwrap());
+        let lmid = u32::from_be_bytes(raw[16..20].try_into().unwrap());
+        let rmid = u32::from_be_bytes(raw[20..24].try_into().unwrap());
+        let body = PTCPBody::parse(&raw[24..])?;
 
-        Ok(PTCPPacket {
+        Ok(Self {
             sent,
             recv,
             pid,
@@ -911,6 +1006,9 @@ struct PTCPSession {
     rmid: u32,
     recent_packets: HashSet<PacketIdentity>,
     recent_packet_order: VecDeque<PacketIdentity>,
+    reorder_buf: HashMap<u32, PTCPPacket>,
+    gap_since: Option<time::Instant>,
+    sent_history: VecDeque<(u32, u32, Vec<u8>)>,
 }
 
 impl PTCPSession {
@@ -923,6 +1021,9 @@ impl PTCPSession {
             rmid: 0,
             recent_packets: HashSet::new(),
             recent_packet_order: VecDeque::new(),
+            reorder_buf: HashMap::new(),
+            gap_since: None,
+            sent_history: VecDeque::new(),
         }
     }
 
@@ -935,15 +1036,16 @@ impl PTCPSession {
         };
         let lmid = self.id;
         let rmid = self.rmid;
+        let body_len = body.len() as u32;
 
-        self.sent = self.sent.wrapping_add(body.len() as u32);
+        self.sent = self.sent.wrapping_add(body_len);
         self.id = self.id.wrapping_add(1);
         self.count = self.count.wrapping_add(match body {
             PTCPBody::Sync | PTCPBody::Empty => 0,
             _ => 1,
         });
 
-        PTCPPacket {
+        let pkt = PTCPPacket {
             sent,
             recv,
             pid,
@@ -951,17 +1053,47 @@ impl PTCPSession {
             rmid,
             body,
             duplicate: false,
+        };
+
+        if body_len > 0 {
+            let end_seq = sent.wrapping_add(body_len);
+            self.sent_history.push_back((sent, end_seq, pkt.serialize()));
+            while self.sent_history.len() > 128 {
+                self.sent_history.pop_front();
+            }
+        }
+
+        pkt
+    }
+
+    fn prune_acked(&mut self, remote_recv: u32) {
+        while let Some(&(_, end_seq, _)) = self.sent_history.front() {
+            if !sequence_is_after(end_seq, remote_recv) {
+                self.sent_history.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
-    fn recv(&mut self, mut packet: PTCPPacket) -> PTCPPacket {
+    fn retransmit_from(&self, missing_sent: u32) -> Vec<Vec<u8>> {
+        self.sent_history
+            .iter()
+            .filter(|&&(pkt_sent, _, _)| {
+                pkt_sent == missing_sent || sequence_is_after(pkt_sent, missing_sent)
+            })
+            .take(16)
+            .map(|(_, _, raw)| raw.clone())
+            .collect()
+    }
+
+    fn recv_sync(&mut self, mut packet: PTCPPacket) -> PTCPPacket {
         let identity = packet.identity();
         if self.recent_packets.contains(&identity) {
             packet.duplicate = true;
             self.rmid = packet.lmid;
             return packet;
         }
-
         self.recent_packets.insert(identity);
         self.recent_packet_order.push_back(identity);
         if self.recent_packet_order.len() > RECENT_PACKET_WINDOW {
@@ -969,13 +1101,99 @@ impl PTCPSession {
                 self.recent_packets.remove(&expired);
             }
         }
-
-        let remote_end = packet.sent.wrapping_add(packet.body.len() as u32);
+        let remote_end = cmp::max(packet.sent.wrapping_add(packet.body.len() as u32), 4);
         if sequence_is_after(remote_end, self.recv) {
             self.recv = remote_end;
         }
         self.rmid = packet.lmid;
+        self.prune_acked(packet.recv);
         packet
+    }
+
+    fn recv_ordered(
+        &mut self,
+        packet: PTCPPacket,
+    ) -> (Vec<PTCPPacket>, Option<PTCPPacket>, Vec<Vec<u8>>) {
+        self.prune_acked(packet.recv);
+
+        if matches!(&packet.body, PTCPBody::Command(_)) || (packet.pid & 0xFF00_0000) != 0 {
+            self.rmid = packet.lmid;
+            let retrans = self.retransmit_from(packet.recv);
+            return (Vec::new(), None, retrans);
+        }
+
+        if matches!(&packet.body, PTCPBody::Empty) {
+            self.rmid = packet.lmid;
+            return (Vec::new(), None, Vec::new());
+        }
+
+        let body_len = packet.body.len() as u32;
+        let remote_end = packet.sent.wrapping_add(body_len);
+
+        // Already processed in-order packet (retransmission of old sequence)
+        if !sequence_is_after(remote_end, self.recv) {
+            self.rmid = packet.lmid;
+            return (Vec::new(), Some(self.send(PTCPBody::Empty)), Vec::new());
+        }
+
+        // Exact next contiguous packet in the PTCP byte stream
+        if packet.sent == self.recv {
+            self.recv = remote_end;
+            self.rmid = packet.lmid;
+            let mut ready = vec![packet];
+
+            while let Some(next_pkt) = self.reorder_buf.remove(&self.recv) {
+                self.recv = self.recv.wrapping_add(next_pkt.body.len() as u32);
+                self.rmid = next_pkt.lmid;
+                ready.push(next_pkt);
+            }
+
+            if self.reorder_buf.is_empty() {
+                self.gap_since = None;
+            } else {
+                self.gap_since = Some(time::Instant::now());
+            }
+
+            let ack = self.send(PTCPBody::Empty);
+            return (ready, Some(ack), Vec::new());
+        }
+
+        // Out-of-order future packet (e.g. small trailing keyframe fragment arriving ahead of full-MTU chunks)
+        self.reorder_buf.entry(packet.sent).or_insert(packet);
+        if self.gap_since.is_none() {
+            self.gap_since = Some(time::Instant::now());
+        }
+
+        let gap_elapsed = self
+            .gap_since
+            .map(|t| t.elapsed())
+            .unwrap_or(Duration::ZERO);
+
+        if self.reorder_buf.len() > 32 || gap_elapsed > Duration::from_millis(20) {
+            let next_sent = self
+                .reorder_buf
+                .keys()
+                .copied()
+                .min_by_key(|&s| s.wrapping_sub(self.recv));
+            if let Some(jump_sent) = next_sent {
+                self.recv = jump_sent;
+                let mut ready = Vec::new();
+                while let Some(next_pkt) = self.reorder_buf.remove(&self.recv) {
+                    self.recv = self.recv.wrapping_add(next_pkt.body.len() as u32);
+                    self.rmid = next_pkt.lmid;
+                    ready.push(next_pkt);
+                }
+                self.gap_since = if self.reorder_buf.is_empty() {
+                    None
+                } else {
+                    Some(time::Instant::now())
+                };
+                let ack = self.send(PTCPBody::Empty);
+                return (ready, Some(ack), Vec::new());
+            }
+        }
+
+        (Vec::new(), None, Vec::new())
     }
 }
 
@@ -1049,6 +1267,7 @@ async fn dh_writer(
     remote_port: u32,
 ) {
     while let Some(ev) = dh_rx.recv().await {
+        let is_data_or_bind = matches!(ev, PTCPEvent::Connect(_) | PTCPEvent::Data(_, _));
         let pkt = {
             let Ok(mut sess) = session.lock() else {
                 continue;
@@ -1065,6 +1284,9 @@ async fn dh_writer(
             }
         };
         let _ = ptcp_request(&socket, pkt).await;
+        if is_data_or_bind {
+            time::sleep(Duration::from_millis(6)).await;
+        }
     }
 }
 
@@ -1079,50 +1301,41 @@ async fn dh_reader(
             .await
             .map_err(|_| "Relay heartbeat timeout".to_string())??;
 
-        let (packet, dup_ack) = {
+        // Immediately notify CONN/DISC status before reorder buffering so Bind never waits on video packets
+        if let PTCPBody::Status(realm, ref status) = raw_pkt.body {
+            if status == "CONN" {
+                if let Ok(mut map) = conn_channels.lock() {
+                    if let Some(connected) = map.remove(&realm) {
+                        let _ = connected.send(true);
+                    }
+                }
+            } else if status == "DISC" {
+                if let Ok(mut map) = conn_channels.lock() {
+                    map.remove(&realm);
+                }
+                if let Ok(mut map) = channels.lock() {
+                    map.remove(&realm);
+                }
+            }
+        }
+
+        let (ready_packets, ack_opt, retransmits) = {
             let Ok(mut sess) = session.lock() else {
                 continue;
             };
-            let pkt = sess.recv(raw_pkt);
-            let ack = if pkt.duplicate && !matches!(&pkt.body, PTCPBody::Empty) {
-                Some(sess.send(PTCPBody::Empty))
-            } else {
-                None
-            };
-            (pkt, ack)
+            sess.recv_ordered(raw_pkt)
         };
 
-        if let Some(ack_pkt) = dup_ack {
-            let _ = ptcp_request(&socket, ack_pkt).await;
-            continue;
-        }
-        if packet.duplicate || matches!(&packet.body, PTCPBody::Empty) {
-            continue;
+        for raw in retransmits {
+            let _ = socket.send(&raw).await;
         }
 
-        let ack_opt = session.lock().ok().map(|mut sess| sess.send(PTCPBody::Empty));
         if let Some(ack_pkt) = ack_opt {
             let _ = ptcp_request(&socket, ack_pkt).await;
         }
 
-        match packet.body {
-            PTCPBody::Status(realm, status) => {
-                if status == "CONN" {
-                    if let Ok(mut map) = conn_channels.lock() {
-                        if let Some(connected) = map.remove(&realm) {
-                            let _ = connected.send(true);
-                        }
-                    }
-                } else if status == "DISC" {
-                    if let Ok(mut map) = conn_channels.lock() {
-                        map.remove(&realm);
-                    }
-                    if let Ok(mut map) = channels.lock() {
-                        map.remove(&realm);
-                    }
-                }
-            }
-            PTCPBody::Payload(p) => {
+        for packet in ready_packets {
+            if let PTCPBody::Payload(p) = packet.body {
                 let tx = channels.lock().ok().and_then(|map| map.get(&p.realm).cloned());
                 if let Some(tx) = tx {
                     if tx.send(p.data).await.is_err() {
@@ -1132,7 +1345,7 @@ async fn dh_reader(
                     }
                 }
             }
-            _ => {}
         }
     }
 }
+
