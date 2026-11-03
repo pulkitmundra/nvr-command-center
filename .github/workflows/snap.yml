@@ -1,0 +1,281 @@
+name: Build and Publish Snap
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+      - "CHANGELOG.md"
+      - "LICENSE"
+      - ".github/FUNDING.yml"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Snap Store channel to release to (e.g. stable, candidate, edge)"
+        required: false
+        default: "stable"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  snap:
+    name: Build & Publish to Snap Store
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & build release binary
+        run: |
+          cargo build --release
+
+      - name: Build Snap package (core24)
+        run: |
+          set -euo pipefail
+          PRIME="/tmp/snap-prime"
+          rm -rf "$PRIME"
+          mkdir -p "$PRIME/bin" "$PRIME/usr/bin" "$PRIME/usr/lib/x86_64-linux-gnu" "$PRIME/meta/gui"
+
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            squashfs-tools ffmpeg \
+            libgl1 libegl1 libglx0 libopengl0 libgles2 libdrm2 libgbm1 \
+            libx11-6 libx11-xcb1 libxcb1 libxcursor1 libxrandr2 libxi6 \
+            libxext6 libxfixes3 libxrender1 libxinerama1 \
+            libxkbcommon0 libxkbcommon-x11-0 \
+            libwayland-client0 libwayland-cursor0 libwayland-egl1 ca-certificates >/dev/null
+
+          cp target/release/rtsp-camera-viewer "$PRIME/bin/rtsp-camera-viewer"
+          chmod 0755 "$PRIME/bin/rtsp-camera-viewer"
+          cp assets/icon.png "$PRIME/meta/gui/icon.png"
+          cp snap/gui/nvr-command-center.desktop "$PRIME/meta/gui/nvr-command-center.desktop"
+
+          python3 - << 'PY'
+          import os, glob, shutil, subprocess
+
+          prime = "/tmp/snap-prime"
+          for b in ("/usr/bin/ffmpeg", "/usr/bin/ffprobe"):
+              shutil.copy2(b, f"{prime}{b}")
+              os.chmod(f"{prime}{b}", 0o755)
+
+          seed_bins = ["/usr/bin/ffmpeg", "/usr/bin/ffprobe"]
+          for pat in [
+              "/usr/lib/x86_64-linux-gnu/libX11*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXcursor*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXrandr*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXi*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXext*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXfixes*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXrender*.so*",
+              "/usr/lib/x86_64-linux-gnu/libXinerama*.so*",
+              "/usr/lib/x86_64-linux-gnu/libxcb*.so*",
+              "/usr/lib/x86_64-linux-gnu/libxkbcommon*.so*",
+              "/usr/lib/x86_64-linux-gnu/libwayland-*.so*",
+              "/usr/lib/x86_64-linux-gnu/libGL.so*",
+              "/usr/lib/x86_64-linux-gnu/libGLX.so*",
+              "/usr/lib/x86_64-linux-gnu/libGLdispatch.so*",
+              "/usr/lib/x86_64-linux-gnu/libEGL.so*",
+              "/usr/lib/x86_64-linux-gnu/libOpenGL*.so*",
+              "/usr/lib/x86_64-linux-gnu/libdrm*.so*",
+              "/usr/lib/x86_64-linux-gnu/libgbm*.so*",
+          ]:
+              seed_bins.extend(glob.glob(pat))
+
+          core_exclude = {
+              "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1",
+              "libresolv.so.2", "libgcc_s.so.1", "ld-linux-x86-64.so.2"
+          }
+          libs = set()
+          for target in seed_bins:
+              if not os.path.exists(target):
+                  continue
+              if target.startswith("/usr/lib/"):
+                  libs.add(os.path.realpath(target))
+                  libs.add(target)
+              out = subprocess.check_output(["ldd", target], text=True, stderr=subprocess.DEVNULL)
+              for line in out.splitlines():
+                  if "=>" in line:
+                      parts = line.split("=>")[1].strip().split()
+                      if parts and parts[0].startswith("/"):
+                          p = parts[0]
+                          if os.path.basename(p) not in core_exclude:
+                              libs.add(p)
+                              libs.add(os.path.realpath(p))
+
+          lib_dest = f"{prime}/usr/lib/x86_64-linux-gnu"
+          for p in sorted(libs):
+              base = os.path.basename(p)
+              if base in core_exclude or base.startswith(("libLLVM", "libgallium", "libnvidia")) or not os.path.exists(p):
+                  continue
+              dst = os.path.join(lib_dest, base)
+              if not os.path.exists(dst):
+                  shutil.copy2(p, dst)
+
+          for name in sorted(os.listdir(lib_dest), key=len, reverse=True):
+              full = os.path.join(lib_dest, name)
+              host_full = os.path.join("/usr/lib/x86_64-linux-gnu", name)
+              if os.path.islink(host_full):
+                  target = os.path.basename(os.readlink(host_full))
+                  if os.path.exists(os.path.join(lib_dest, target)):
+                      os.remove(full)
+                      os.symlink(target, full)
+          PY
+
+          cat << 'LAUNCH' > "$PRIME/bin/nvr-command-center"
+          #!/bin/sh
+          export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
+          export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+          exec "$SNAP/bin/rtsp-camera-viewer" "$@"
+          LAUNCH
+          chmod 0755 "$PRIME/bin/nvr-command-center"
+
+          cat << 'YAML' > "$PRIME/meta/snap.yaml"
+          name: nvr-command-center
+          version: 2.1.0
+          title: NVR Command Center (RTSP & CCTV Viewer)
+          summary: GPU RTSP IP Camera, CCTV, NVR/DVR/XVR & Cloud P2P Viewer (Dahua, Hikvision)
+          description: |
+            NVR Command Center is an ultra-low-latency, GPU-accelerated multi-camera
+            RTSP IP Camera, CCTV, NVR, DVR, and XVR surveillance video wall and monitor
+            for Linux and Ubuntu, built in Native Rust (eframe/egui + OpenGL) with
+            zero-probe FFmpeg workers and built-in Cloud P2P remote tunneling.
+
+            Stream 1 to 32 concurrent security cameras 24/7 with < 0.9s parallel startup,
+            < 80ms glass-to-glass live latency, zero stream drift, and ~65-110 MB RAM on
+            both local LAN and any remote internet connection.
+
+            Native Linux Alternative for CCTV & NVR Client Apps:
+            * Dahua: SmartPSS (Smart PSS), DMSS (gDMSS / iDMSS), Easy4ip (Easy4ipCloud)
+            * CP Plus (CPPlus): KVMS Pro (KVMS), gCMOB, iCMOB, InstaOn, EzyKam
+            * Hikvision & HiLook: iVMS-4200 (iVMS), Hik-Connect (HikConnect)
+            * Amcrest: Amcrest Surveillance Pro, Amcrest View Pro, Amcrest Cloud
+            * Reolink, Lorex, IMOU (Imou Life), TP-Link Tapo & VIGI, Uniview (UNV / EZView),
+              EZVIZ, Axis, Foscam, Ubiquiti UniFi Protect, ONVIF IP cameras, and RTSP feeds
+              from Frigate, ZoneMinder, Shinobi, Agent DVR, Blue Iris, or Home Assistant.
+
+            Key Architecture & Features:
+            * Zero-Lag Kernel Pipe Burst Drain (ioctl FIONREAD) keeps 0 buffered frames
+              for < 80ms real-time glass-to-glass latency with zero inter-camera drift
+            * Built-in Cloud P2P Remote Access (Easy4ip / InstaOn / P2P Serial Number):
+              view your NVR/DVR/XVR cameras from any outside Wi-Fi or mobile hotspot with
+              zero router port forwarding and zero extra home hardware
+            * Automatic LAN <-> Cloud P2P & Tailscale detection and 1-click Top Bar switch
+            * Instant < 0.9s parallel multi-camera startup (H.265 / HEVC & H.264)
+            * GPU OpenGL UV shader digital zoom (1.0x - 5.0x) and click-drag pan at 0% CPU
+            * Per-camera [SD]/[HD] stream quality toggle and [Single]/[Grid] view buttons
+            * 4.5-second frozen-socket watchdog for 24/7 unattended video wall stability
+            * Patrol Mode auto-rotation, 12-camera composite wall PNG snapshots, and
+              in-app GUI Settings with first-launch Quick Setup wizard
+
+            Search Keywords:
+            rtsp, rtsp viewer, rtsp player, rtsp client, cctv, cctv viewer, cctv monitor,
+            ip camera, ip camera viewer, network camera, security camera, surveillance,
+            video wall, camera monitor, nvr, nvr viewer, nvr client, dvr, xvr, onvif,
+            h265, hevc, h264, dahua, smartpss, smart pss, dmss, gdmss, easy4ip,
+            easy4ipcloud, cp plus, cpplus, kvms, kvms pro, gcmob, instaon, hikvision,
+            ivms, ivms-4200, hik-connect, amcrest, reolink, lorex, imou, tapo, uniview,
+            unv, ezviz, p2p, cloud p2p, tailscale, webcam.
+
+            Support the Project:
+            * Buy Me a Coffee: https://buymeacoffee.com/pulkitmundra
+            * GitHub Sponsors: https://github.com/sponsors/pulkitmundra
+          license: MIT
+          base: core24
+          grade: stable
+          confinement: strict
+          architectures:
+            - amd64
+          apps:
+            nvr-command-center:
+              command: bin/nvr-command-center
+              plugs:
+                - network
+                - network-bind
+                - audio-playback
+                - desktop
+                - desktop-legacy
+                - wayland
+                - x11
+                - opengl
+                - home
+          YAML
+
+          chmod -R a+rX,u+w,go-w "$PRIME"
+          chmod -R a-s "$PRIME"
+          mksquashfs "$PRIME" /tmp/nvr-command-center.snap \
+            -noappend -comp lzo -all-root -no-xattrs -no-fragments >/dev/null
+          ls -lh /tmp/nvr-command-center.snap
+
+      - name: Upload & Release to Canonical Snap Store
+        if: env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          RELEASE_CHANNEL: ${{ inputs.channel || 'stable' }}
+        run: |
+          pip install --quiet craft-store pymacaroons requests
+          python3 - << 'PY'
+          import os, sys, time, requests
+          from craft_store import creds as cs_creds
+          from pymacaroons import Macaroon
+
+          snap_name = "nvr-command-center"
+          snap_path = "/tmp/nvr-command-center.snap"
+          channel = os.environ.get("RELEASE_CHANNEL", "stable")
+          channels = [channel] if channel != "stable" else ["stable", "candidate", "beta", "edge"]
+
+          raw = os.environ["SNAPCRAFT_STORE_CREDENTIALS"].strip()
+          u1 = cs_creds.unmarshal_u1_credentials(raw).model_dump(by_alias=True)
+          root_m = Macaroon.deserialize(u1["r"])
+          discharge_m = Macaroon.deserialize(u1["d"])
+          bound = root_m.prepare_for_request(discharge_m).serialize()
+          auth = f"Macaroon root={u1['r']}, discharge={bound}"
+
+          file_size = os.path.getsize(snap_path)
+          print(f"Uploading {snap_path} ({file_size / (1024*1024):.1f} MB)...")
+          with open(snap_path, "rb") as f:
+              up = requests.post(
+                  "https://storage.snapcraftcontent.com/unscanned-upload/",
+                  files={"binary": (os.path.basename(snap_path), f, "application/octet-stream")},
+                  headers={"Accept": "application/json"},
+                  timeout=600,
+              )
+          up.raise_for_status()
+          upload_id = up.json()["upload_id"]
+
+          push = requests.post(
+              "https://dashboard.snapcraft.io/dev/api/snap-push/",
+              json={"name": snap_name, "updown_id": upload_id, "binary_filesize": file_size, "channels": channels},
+              headers={"Authorization": auth, "Accept": "application/json", "Content-Type": "application/json"},
+              timeout=60,
+          )
+          push.raise_for_status()
+          status_url = push.json()["status_details_url"]
+
+          rev = None
+          for _ in range(60):
+              time.sleep(5)
+              st = requests.get(status_url, headers={"Authorization": auth, "Accept": "application/json"}, timeout=30)
+              if st.status_code == 200:
+                  data = st.json()
+                  rev = data.get("revision")
+                  if data.get("processed"):
+                      if not data.get("can_release"):
+                          print("Review errors:", data.get("errors"))
+                          sys.exit(1)
+                      break
+
+          if rev:
+              rel = requests.post(
+                  "https://dashboard.snapcraft.io/dev/api/snap-release/",
+                  json={"name": snap_name, "revision": str(rev), "channels": channels},
+                  headers={"Authorization": auth, "Accept": "application/json", "Content-Type": "application/json"},
+                  timeout=30,
+              )
+              rel.raise_for_status()
+              print("Released revision", rev, "to", channels)
+          PY
