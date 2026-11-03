@@ -117,7 +117,7 @@ parts:
       cat << 'EOF' > "$CRAFT_PART_INSTALL/bin/nvr-command-center"
       #!/bin/sh
       export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
-      export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+      export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:$SNAP/usr/lib/x86_64-linux-gnu/pulseaudio:$SNAP/usr/lib/x86_64-linux-gnu/blas:$SNAP/usr/lib/x86_64-linux-gnu/lapack:${LD_LIBRARY_PATH:-}"
       exec "$SNAP/bin/rtsp-camera-viewer" "$@"
       EOF
       chmod 0755 "$CRAFT_PART_INSTALL/bin/nvr-command-center"
