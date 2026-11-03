@@ -781,7 +781,8 @@ impl CameraViewerApp {
                     .on_hover_text(BUY_ME_A_COFFEE_URL)
                     .clicked()
                 {
-                    open_url(BUY_ME_A_COFFEE_URL);
+                    self.show_toast("Opening Buy Me a Coffee in browser...");
+                    open_url(ui.ctx(), BUY_ME_A_COFFEE_URL);
                 }
 
                 if ui
@@ -1446,13 +1447,16 @@ impl CameraViewerApp {
                         ui.label(RichText::new("Support Open-Source Development").strong());
                         ui.horizontal(|ui| {
                             if ui.button("Buy Me a Coffee").clicked() {
-                                open_url(BUY_ME_A_COFFEE_URL);
+                                self.show_toast("Opening Buy Me a Coffee in browser...");
+                                open_url(ui.ctx(), BUY_ME_A_COFFEE_URL);
                             }
                             if ui.button("GitHub Sponsors").clicked() {
-                                open_url(GITHUB_SPONSORS_URL);
+                                self.show_toast("Opening GitHub Sponsors in browser...");
+                                open_url(ui.ctx(), GITHUB_SPONSORS_URL);
                             }
                             if ui.button("GitHub Repository").clicked() {
-                                open_url(GITHUB_REPO_URL);
+                                self.show_toast("Opening GitHub Repository in browser...");
+                                open_url(ui.ctx(), GITHUB_REPO_URL);
                             }
                         });
                     }
@@ -1655,11 +1659,48 @@ fn read_process_rss_mb() -> f32 {
     0.0
 }
 
-fn open_url(url: &str) {
-    let _ = Command::new("xdg-open")
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+fn open_url(ctx: &egui::Context, url: &str) {
+    // Ensure OS fullscreen is cleared so the browser window can raise to the foreground
+    ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+
+    let target = url.to_string();
+    thread::spawn(move || {
+        let py_launch = concat!(
+            "import os, sys, time, gi; ",
+            "gi.require_version('Gdk', '3.0'); ",
+            "from gi.repository import Gdk, Gio; ",
+            "u = sys.argv[1]; ",
+            "d = Gdk.Display.get_default(); ",
+            "ctx = d.get_app_launch_context(); ",
+            "ctx.set_timestamp(int(time.monotonic() * 1000) & 0xFFFFFFFF); ",
+            "app = Gio.AppInfo.get_default_for_type('x-scheme-handler/https', False); ",
+            "tok = ctx.get_startup_notify_id(app, []); ",
+            "d.sync(); ",
+            "os.environ['DESKTOP_STARTUP_ID'] = tok; ",
+            "os.environ['XDG_ACTIVATION_TOKEN'] = tok; ",
+            "app.launch_uris([u], ctx); ",
+            "d.sync()"
+        );
+
+        let py_status = Command::new("/usr/bin/python3")
+            .arg("-c")
+            .arg(py_launch)
+            .arg(&target)
+            .env("GDK_BACKEND", "x11")
+            .env_remove("LD_LIBRARY_PATH")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        if !matches!(py_status, Ok(s) if s.success()) {
+            let _ = Command::new("xdg-open")
+                .arg(&target)
+                .env_remove("LD_LIBRARY_PATH")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    });
 }
