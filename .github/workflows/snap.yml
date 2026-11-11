@@ -246,14 +246,16 @@ jobs:
           ls -lh /tmp/nvr-command-center.snap
 
       - name: Install Snap Store publish dependencies
-        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        env:
+          HAS_SNAP_CREDS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: env.HAS_SNAP_CREDS == 'true'
         run: |
           sudo apt-get install -y -qq --no-install-recommends python3-venv >/dev/null
           python3 -m venv /tmp/snap-venv
           /tmp/snap-venv/bin/pip install --quiet craft-store pymacaroons requests
 
       - name: Upload & Release to Canonical Snap Store
-        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: env.SNAPCRAFT_STORE_CREDENTIALS != ''
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
           RELEASE_CHANNEL: ${{ github.event_name == 'push' && 'edge' || inputs.channel || 'stable' }}
