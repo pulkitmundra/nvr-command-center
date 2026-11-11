@@ -25,7 +25,16 @@ const BUY_ME_A_COFFEE_URL: &str = "https://buymeacoffee.com/pulkitmundra";
 const GITHUB_SPONSORS_URL: &str = "https://github.com/sponsors/pulkitmundra";
 const GITHUB_REPO_URL: &str = "https://github.com/pulkitmundra/nvr-command-center";
 
-#[derive(Default)]
+#[inline]
+fn safe_clamp_f32(val: f32, min: f32, max: f32) -> f32 {
+    if !max.is_finite() {
+        return min.max(0.0);
+    }
+    let hi = max.max(0.0);
+    let lo = min.min(hi);
+    val.clamp(lo, hi)
+}
+
 struct TileUiState {
     texture: Option<TextureHandle>,
     last_uploaded_seq: u64,
@@ -33,6 +42,12 @@ struct TileUiState {
     tex_height: u32,
     zoom: f32,
     pan_uv: Vec2,
+}
+
+impl Default for TileUiState {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TileUiState {
@@ -82,6 +97,7 @@ pub struct CameraViewerApp {
     p2p_mgr: P2PTunnelManager,
     stream_mgr: StreamManager,
     tiles: BTreeMap<usize, TileUiState>,
+    upload_scratch: Vec<u8>,
 
     fullscreen_channel: Option<usize>,
     all_paused: bool,
@@ -158,6 +174,7 @@ impl CameraViewerApp {
             p2p_mgr,
             stream_mgr,
             tiles,
+            upload_scratch: Vec::new(),
             fullscreen_channel: None,
             all_paused: false,
             patrol_active: false,
@@ -195,28 +212,22 @@ impl CameraViewerApp {
 
     fn enter_fullscreen(&mut self, channel: usize) {
         self.fullscreen_channel = Some(channel);
-        self.stream_mgr.set_fullscreen_focus(
-            Some(channel),
-            self.app_cfg.fullscreen_auto_hd,
-            self.env_cfg.default_subtype,
-        );
+        self.stream_mgr
+            .set_fullscreen_focus(Some(channel), self.app_cfg.fullscreen_auto_hd);
     }
 
     fn exit_fullscreen(&mut self) {
         self.fullscreen_channel = None;
         self.patrol_active = false;
-        self.stream_mgr.set_fullscreen_focus(
-            None,
-            self.app_cfg.fullscreen_auto_hd,
-            self.env_cfg.default_subtype,
-        );
+        self.stream_mgr
+            .set_fullscreen_focus(None, self.app_cfg.fullscreen_auto_hd);
     }
 
     fn toggle_camera_hd_sd(&mut self, channel: usize) {
         if let Some(slot) = self.stream_mgr.slot(channel) {
             let current_target = slot.target_subtype.load(Ordering::Acquire);
             let next_sub = if current_target == 0 { 1 } else { 0 };
-            slot.request_subtype(next_sub);
+            slot.set_manual_subtype(next_sub);
             let label = if next_sub == 0 { "HD (Main-Stream)" } else { "SD (Sub-Stream)" };
             self.show_toast(format!(
                 "{} switched to {}",
@@ -224,6 +235,47 @@ impl CameraViewerApp {
                 label
             ));
         }
+    }
+
+    fn reset_tiles_for_restart(&mut self) {
+        let max_ch = self.app_cfg.num_cameras;
+        self.tiles.retain(|&ch, _| ch <= max_ch);
+        for ch in 1..=max_ch {
+            let tile = self.tiles.entry(ch).or_default();
+            tile.last_uploaded_seq = 0;
+        }
+        if self.fullscreen_channel.is_some_and(|ch| ch > max_ch) {
+            self.fullscreen_channel = None;
+            self.patrol_active = false;
+        }
+    }
+
+    fn restart_streams_with_current_env(&mut self) {
+        self.reset_tiles_for_restart();
+        self.stream_mgr.update_env_and_restart(self.env_cfg.clone());
+        if self.all_paused {
+            self.stream_mgr.set_all_paused(true);
+        }
+        if let Some(fs_ch) = self.fullscreen_channel {
+            self.stream_mgr
+                .set_fullscreen_focus(Some(fs_ch), self.app_cfg.fullscreen_auto_hd);
+        }
+    }
+
+    fn trigger_manual_resync(&mut self) {
+        if self.env_cfg.use_cloud_p2p
+            && !self.env_cfg.p2p_serial.trim().is_empty()
+            && self.p2p_mgr.is_halted()
+        {
+            self.p2p_mgr.clear_active_key();
+            let prev_port = self.env_cfg.p2p_local_port;
+            self.sync_p2p_tunnel();
+            if self.env_cfg.p2p_local_port != prev_port {
+                self.restart_streams_with_current_env();
+                return;
+            }
+        }
+        self.stream_mgr.resync_all();
     }
 
     fn cycle_fullscreen(&mut self, delta: isize) {
@@ -338,19 +390,17 @@ impl CameraViewerApp {
     fn apply_and_save_settings(&mut self) {
         self.edit_env_cfg.num_cameras = self.edit_env_cfg.num_cameras.clamp(1, 32);
         self.env_cfg = self.edit_env_cfg.clone();
+        self.p2p_mgr.clear_active_key();
         self.sync_p2p_tunnel();
         self.app_cfg.num_cameras = self.env_cfg.num_cameras;
         self.app_cfg.normalize_channels();
 
-        for ch in 1..=self.app_cfg.num_cameras {
-            self.tiles.entry(ch).or_insert_with(TileUiState::new);
-        }
-
         let _ = save_env_config(&self.env_path, &self.env_cfg);
         let _ = self.app_cfg.save();
 
-        self.stream_mgr.update_env_and_restart(self.env_cfg.clone());
         self.fullscreen_channel = None;
+        self.patrol_active = false;
+        self.restart_streams_with_current_env();
         self.show_toast(format!(
             "Saved configuration ({} cameras on {}:{})",
             self.env_cfg.num_cameras,
@@ -386,7 +436,7 @@ impl CameraViewerApp {
                     self.cycle_fullscreen(-1);
                 }
             } else if i.key_pressed(Key::R) {
-                self.stream_mgr.resync_all();
+                self.trigger_manual_resync();
                 self.show_toast("Re-synced all camera streams to live edge");
             } else if i.key_pressed(Key::P) || i.key_pressed(Key::Space) {
                 self.all_paused = !self.all_paused;
@@ -455,31 +505,43 @@ impl CameraViewerApp {
                 continue;
             };
             let seq = slot.frame_seq.load(Ordering::Acquire);
-            let tile = self.tiles.entry(ch).or_insert_with(TileUiState::new);
+            let tile = self.tiles.entry(ch).or_default();
 
             if seq > 0 && seq != tile.last_uploaded_seq {
-                if let Ok(guard) = slot.buffer.lock() {
+                let dims = if let Ok(guard) = slot.buffer.lock() {
                     let w = guard.width as usize;
                     let h = guard.height as usize;
                     if w > 0 && h > 0 && guard.rgba.len() == w * h * 4 {
-                        let color_img =
-                            ColorImage::from_rgba_unmultiplied([w, h], &guard.rgba);
-                        match &mut tile.texture {
-                            Some(tex) if tile.tex_width == guard.width && tile.tex_height == guard.height => {
-                                tex.set(color_img, TextureOptions::LINEAR);
-                            }
-                            _ => {
-                                tile.texture = Some(ctx.load_texture(
-                                    format!("cam_tex_{}", ch),
-                                    color_img,
-                                    TextureOptions::LINEAR,
-                                ));
-                                tile.tex_width = guard.width;
-                                tile.tex_height = guard.height;
-                            }
-                        }
-                        tile.last_uploaded_seq = seq;
+                        self.upload_scratch.clear();
+                        self.upload_scratch.extend_from_slice(&guard.rgba);
+                        Some((guard.width, guard.height))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+
+                if let Some((tex_w, tex_h)) = dims {
+                    let color_img = ColorImage::from_rgba_unmultiplied(
+                        [tex_w as usize, tex_h as usize],
+                        &self.upload_scratch,
+                    );
+                    match &mut tile.texture {
+                        Some(tex) if tile.tex_width == tex_w && tile.tex_height == tex_h => {
+                            tex.set(color_img, TextureOptions::LINEAR);
+                        }
+                        _ => {
+                            tile.texture = Some(ctx.load_texture(
+                                format!("cam_tex_{}", ch),
+                                color_img,
+                                TextureOptions::LINEAR,
+                            ));
+                            tile.tex_width = tex_w;
+                            tile.tex_height = tex_h;
+                        }
+                    }
+                    tile.last_uploaded_seq = seq;
                 }
             }
         }
@@ -567,12 +629,13 @@ impl CameraViewerApp {
                     self.env_cfg.use_cloud_p2p = !self.env_cfg.use_cloud_p2p;
                     if self.env_cfg.use_cloud_p2p {
                         self.env_cfg.use_tailscale = false;
+                        self.p2p_mgr.clear_active_key();
                     }
                     self.edit_env_cfg.use_cloud_p2p = self.env_cfg.use_cloud_p2p;
                     self.edit_env_cfg.use_tailscale = self.env_cfg.use_tailscale;
                     self.sync_p2p_tunnel();
                     let _ = save_env_config(&self.env_path, &self.env_cfg);
-                    self.stream_mgr.update_env_and_restart(self.env_cfg.clone());
+                    self.restart_streams_with_current_env();
                     let mode_desc = if self.env_cfg.use_cloud_p2p {
                         "Cloud P2P Tunnel (works on any internet connection)"
                     } else {
@@ -583,7 +646,7 @@ impl CameraViewerApp {
                     self.env_cfg.use_tailscale = !self.env_cfg.use_tailscale;
                     self.edit_env_cfg.use_tailscale = self.env_cfg.use_tailscale;
                     let _ = save_env_config(&self.env_path, &self.env_cfg);
-                    self.stream_mgr.update_env_and_restart(self.env_cfg.clone());
+                    self.restart_streams_with_current_env();
                     self.show_toast(format!("Switched to {}", self.env_cfg.active_host()));
                 } else {
                     self.show_settings = true;
@@ -650,7 +713,7 @@ impl CameraViewerApp {
                 .on_hover_text("Flush all buffers and re-lock all cameras to live edge")
                 .clicked()
             {
-                self.stream_mgr.resync_all();
+                self.trigger_manual_resync();
                 self.show_toast("Flushed all buffers -> Locked to live edge");
             }
 
@@ -838,8 +901,8 @@ impl CameraViewerApp {
             .unwrap_or(0.0);
 
         let pointer_pos = ui.input(|i| i.pointer.interact_pos());
-        let over_sd_hd_btn = pointer_pos.map_or(false, |p| sd_hd_rect.contains(p));
-        let over_view_btn = pointer_pos.map_or(false, |p| view_btn_rect.contains(p));
+        let over_sd_hd_btn = pointer_pos.is_some_and(|p| sd_hd_rect.contains(p));
+        let over_view_btn = pointer_pos.is_some_and(|p| view_btn_rect.contains(p));
         let over_hud_btn = over_sd_hd_btn || over_view_btn;
 
         if over_hud_btn {
@@ -864,7 +927,7 @@ impl CameraViewerApp {
 
         // Handle UV digital zoom & pan + double-click Single View
         {
-            let tile = self.tiles.entry(channel).or_insert_with(TileUiState::new);
+            let tile = self.tiles.entry(channel).or_default();
             if response.hovered() {
                 let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
                 if scroll_y.abs() > 0.1 {
@@ -918,7 +981,7 @@ impl CameraViewerApp {
                 Align2::CENTER_CENTER,
                 status.label(),
                 FontId::new(12.0, FontFamily::Proportional),
-                 Color32::from_rgb(100, 116, 139),
+                Color32::from_rgb(100, 116, 139),
             );
         }
 
@@ -940,7 +1003,10 @@ impl CameraViewerApp {
         let hud_text = format!("  {}  [{}]", cam_name, qual_tag);
         let pill_rect = Rect::from_min_size(
             rect.min + Vec2::new(6.0, 6.0),
-            Vec2::new((hud_text.len() as f32 * 7.2).clamp(95.0, rect.width() - 12.0), 22.0),
+            Vec2::new(
+                safe_clamp_f32(hud_text.len() as f32 * 7.2, 95.0, rect.width() - 12.0),
+                22.0,
+            ),
         );
         painter.rect_filled(
             pill_rect,
@@ -952,7 +1018,7 @@ impl CameraViewerApp {
             StreamStatus::Live => Color32::from_rgb(16, 185, 129),
             StreamStatus::Connecting | StreamStatus::Reconnecting => Color32::from_rgb(245, 158, 11),
             StreamStatus::Paused => Color32::from_rgb(148, 163, 184),
-            StreamStatus::Error => Color32::from_rgb(239, 68, 68),
+            StreamStatus::Error | StreamStatus::AuthError => Color32::from_rgb(239, 68, 68),
         };
         painter.circle_filled(
             Pos2::new(pill_rect.min.x + 10.0, pill_rect.center().y),
@@ -1089,7 +1155,7 @@ impl CameraViewerApp {
             {
                 ui.close_menu();
                 if let Some(slot) = self.stream_mgr.slot(channel) {
-                    slot.request_subtype(if target_sub == 0 { 1 } else { 0 });
+                    slot.set_manual_subtype(if target_sub == 0 { 1 } else { 0 });
                 }
             }
 
@@ -1105,12 +1171,10 @@ impl CameraViewerApp {
                 }
             }
 
-            if zoom_val > 1.01 {
-                if ui.button("Reset Digital Zoom (1.0x)").clicked() {
-                    ui.close_menu();
-                    if let Some(t) = self.tiles.get_mut(&channel) {
-                        t.reset_zoom();
-                    }
+            if zoom_val > 1.01 && ui.button("Reset Digital Zoom (1.0x)").clicked() {
+                ui.close_menu();
+                if let Some(t) = self.tiles.get_mut(&channel) {
+                    t.reset_zoom();
                 }
             }
 
@@ -1601,7 +1665,8 @@ impl eframe::App for CameraViewerApp {
                 if let Some((ref msg, ts)) = self.toast_message {
                     if ts.elapsed() < Duration::from_millis(3200) {
                         let painter = ui.painter();
-                        let width = (msg.len() as f32 * 7.5 + 28.0).clamp(180.0, avail.width() - 20.0);
+                        let width =
+                            safe_clamp_f32(msg.len() as f32 * 7.5 + 28.0, 180.0, avail.width() - 20.0);
                         let toast_rect = Rect::from_center_size(
                             Pos2::new(avail.center().x, avail.max.y - 26.0),
                             Vec2::new(width, 30.0),
@@ -1632,8 +1697,9 @@ impl eframe::App for CameraViewerApp {
         self.render_settings_modal(ctx);
         self.render_rename_modal(ctx);
 
-        // Synchronized presentation tick (~30 Hz UI check, zero texture upload unless frame_seq changed)
-        ctx.request_repaint_after(Duration::from_millis(33));
+        // Synchronized presentation tick (~30 Hz active UI check, 250ms idle check when paused)
+        let repaint_ms = if self.all_paused { 250 } else { 33 };
+        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
     }
 }
 
@@ -1704,3 +1770,31 @@ fn open_url(ctx: &egui::Context, url: &str) {
         }
     });
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_safe_clamp_never_panics_on_narrow_viewports() {
+        assert_eq!(safe_clamp_f32(120.0, 95.0, 280.0), 120.0);
+        assert_eq!(safe_clamp_f32(40.0, 95.0, 280.0), 95.0);
+        assert_eq!(safe_clamp_f32(400.0, 95.0, 280.0), 280.0);
+
+        // Narrow tiles / split-screen windows where max < min or max <= 0
+        assert_eq!(safe_clamp_f32(120.0, 95.0, 28.0), 28.0);
+        assert_eq!(safe_clamp_f32(10.0, 95.0, 28.0), 28.0);
+        assert_eq!(safe_clamp_f32(120.0, 180.0, 0.0), 0.0);
+        assert_eq!(safe_clamp_f32(120.0, 180.0, -15.0), 0.0);
+        assert_eq!(safe_clamp_f32(120.0, 95.0, f32::NAN), 95.0);
+    }
+
+    #[test]
+    fn test_tile_ui_state_default_zoom_is_one() {
+        let tile = TileUiState::default();
+        assert_eq!(tile.zoom, 1.0);
+        assert_eq!(tile.pan_uv, Vec2::ZERO);
+        assert_eq!(tile.last_uploaded_seq, 0);
+    }
+}
+

@@ -37,9 +37,15 @@ jobs:
       - name: Build Snap package (core24)
         run: |
           set -euo pipefail
+          SNAP_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$SNAP_VERSION" ]; then
+            echo "Failed to extract version from Cargo.toml" >&2
+            exit 1
+          fi
+
           PRIME="/tmp/snap-prime"
           rm -rf "$PRIME"
-          mkdir -p "$PRIME/bin" "$PRIME/usr/bin" "$PRIME/usr/lib/x86_64-linux-gnu" "$PRIME/meta/gui"
+          mkdir -p "$PRIME/bin" "$PRIME/usr/bin" "$PRIME/usr/lib/x86_64-linux-gnu" "$PRIME/meta/gui" "$PRIME/gpu-2404"
 
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
@@ -130,13 +136,16 @@ jobs:
           #!/bin/sh
           export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
           export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:${LD_LIBRARY_PATH:-}"
+          if [ -x "$SNAP/gpu-2404/bin/gpu-2404-provider-wrapper" ]; then
+            exec "$SNAP/gpu-2404/bin/gpu-2404-provider-wrapper" "$SNAP/bin/rtsp-camera-viewer" "$@"
+          fi
           exec "$SNAP/bin/rtsp-camera-viewer" "$@"
           LAUNCH
           chmod 0755 "$PRIME/bin/nvr-command-center"
 
           cat << 'YAML' > "$PRIME/meta/snap.yaml"
           name: nvr-command-center
-          version: 2.1.0
+          version: __SNAP_VERSION__
           title: NVR Command Center (RTSP & CCTV Viewer)
           summary: GPU RTSP IP Camera, CCTV, NVR/DVR/XVR & Cloud P2P Viewer (Dahua, Hikvision)
           description: |
@@ -185,11 +194,35 @@ jobs:
             * Buy Me a Coffee: https://buymeacoffee.com/pulkitmundra
             * GitHub Sponsors: https://github.com/sponsors/pulkitmundra
           license: MIT
+          links:
+            contact:
+              - https://github.com/pulkitmundra/nvr-command-center/issues
+            donation:
+              - https://buymeacoffee.com/pulkitmundra
+              - https://github.com/sponsors/pulkitmundra
+            issues:
+              - https://github.com/pulkitmundra/nvr-command-center/issues
+            source-code:
+              - https://github.com/pulkitmundra/nvr-command-center
+            website:
+              - https://github.com/pulkitmundra/nvr-command-center
           base: core24
           grade: stable
           confinement: strict
           architectures:
             - amd64
+          plugs:
+            gpu-2404:
+              interface: content
+              target: $SNAP/gpu-2404
+              default-provider: mesa-2404
+          layout:
+            /usr/share/libdrm:
+              bind: $SNAP/gpu-2404/libdrm
+            /usr/share/drirc.d:
+              symlink: $SNAP/gpu-2404/drirc.d
+            /usr/share/X11/XErrorDB:
+              symlink: $SNAP/gpu-2404/X11/XErrorDB
           apps:
             nvr-command-center:
               command: bin/nvr-command-center
@@ -204,6 +237,7 @@ jobs:
                 - opengl
                 - home
           YAML
+          sed -i "s/__SNAP_VERSION__/$SNAP_VERSION/" "$PRIME/meta/snap.yaml"
 
           chmod -R a+rX,u+w,go-w "$PRIME"
           chmod -R a-s "$PRIME"
@@ -211,14 +245,20 @@ jobs:
             -noappend -comp lzo -all-root -no-xattrs -no-fragments >/dev/null
           ls -lh /tmp/nvr-command-center.snap
 
+      - name: Install Snap Store publish dependencies
+        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        run: |
+          sudo apt-get install -y -qq --no-install-recommends python3-venv >/dev/null
+          python3 -m venv /tmp/snap-venv
+          /tmp/snap-venv/bin/pip install --quiet craft-store pymacaroons requests
+
       - name: Upload & Release to Canonical Snap Store
-        if: env.SNAPCRAFT_STORE_CREDENTIALS != ''
+        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
-          RELEASE_CHANNEL: ${{ inputs.channel || 'stable' }}
+          RELEASE_CHANNEL: ${{ github.event_name == 'push' && 'edge' || inputs.channel || 'stable' }}
         run: |
-          pip install --quiet craft-store pymacaroons requests
-          python3 - << 'PY'
+          /tmp/snap-venv/bin/python3 - << 'PY'
           import os, sys, time, requests
           from craft_store import creds as cs_creds
           from pymacaroons import Macaroon

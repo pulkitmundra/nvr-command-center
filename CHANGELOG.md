@@ -2,6 +2,13 @@
 
 All notable changes to **NVR Command Center** are documented in this file.
 
+## [2.1.1] - 2026-11-11
+
+### Fixed
+- **Safe `.env` Discovery & Inline Comment Parsing (`src/config.rs`):** Prioritized `SNAP_USER_COMMON/.env` and `~/.rtsp_viewer/.env` over unrelated CWD `.env` files, enforced atomic `0600`/`0700` saves, stripped inline `#` comments outside quotes, and bracketed IPv6 hosts.
+- **Cloud P2P Tunnel Concurrency & Isolation (`src/p2p.rs`):** Eliminated thread-generation status clobbering with monotonic generation guards + `< 5ms` `watch` shutdown, added per-camera write timeouts and non-blocking `try_send` so a single stalled client cannot block other cameras, rejected truncated PTCP datagrams, and halted retries on `401` auth failures to prevent NVR account lockouts.
+- **Active Kernel Pipe Burst Drain & Process Lifecycle (`src/stream.rs`, `src/app.rs`):** Expanded Linux pipe buffers via `fcntl(F_SETPIPE_SZ, 1_048_576)` so `ioctl(FIONREAD)` holds multiple SD frames, added `PR_SET_PDEATHSIG(SIGKILL)` + FFmpeg socket timeouts, tracked Patrol Mode auto-HD promotions so prior cameras return to SD, guarded narrow-window `f32::clamp`, and added `gpu-2404` (`mesa-2404`) support to the `core24` Snap.
+
 ## [2.1.0] - 2026-11-03
 
 ### Added

@@ -13,7 +13,7 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     os::unix::io::AsRawFd,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -21,7 +21,7 @@ use std::{
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, UdpSocket},
-    sync::{mpsc, oneshot, Semaphore},
+    sync::{mpsc, oneshot, watch, Notify, Semaphore},
     time,
 };
 use xml::reader::{EventReader, XmlEvent};
@@ -39,9 +39,14 @@ const DHP2P_INFO_MASK: &[u8; 32] = b"kRjmsUB&ezmdGLL67H#$ojw@XflcaIaf";
 const DHP2P_INFO_IV: &[u8; 16] = b"MydvJw*Iw1w&i^kk";
 const RECENT_PACKET_WINDOW: usize = 1024;
 const DEFAULT_LOCAL_PORT: u16 = 15540;
+const REALM_CHANNEL_CAPACITY: usize = 512;
 
 pub fn is_lan_reachable(host: &str, port: u16, timeout_ms: u64) -> bool {
-    let addr_str = format!("{}:{}", host.trim(), port);
+    let formatted_host = crate::config::format_host_for_url(host);
+    if formatted_host.is_empty() {
+        return false;
+    }
+    let addr_str = format!("{}:{}", formatted_host, port);
     let Ok(mut addrs) = addr_str.to_socket_addrs() else {
         return false;
     };
@@ -68,11 +73,56 @@ fn is_tcp_established(stream: &tokio::net::TcpStream) -> bool {
     rc == 0 && info.tcpi_state == 1
 }
 
+async fn wait_for_shutdown(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn set_connected_if_current(
+    connected: &AtomicBool,
+    generation: &AtomicU64,
+    my_gen: u64,
+    val: bool,
+) {
+    if generation.load(Ordering::Acquire) == my_gen {
+        connected.store(val, Ordering::Release);
+    }
+}
+
+fn set_status_if_current(
+    status: &Mutex<String>,
+    generation: &AtomicU64,
+    my_gen: u64,
+    msg: impl Into<String>,
+) {
+    if generation.load(Ordering::Acquire) == my_gen {
+        if let Ok(mut s) = status.lock() {
+            *s = msg.into();
+        }
+    }
+}
+
+fn is_p2p_auth_rejection(err: &str) -> bool {
+    err.starts_with("AUTH_401:")
+        || err.contains("auth error 401")
+        || err.contains("auth error 403")
+        || err.contains("HTTP 401")
+}
+
 pub struct P2PTunnelManager {
     active_key: String,
     local_port: u16,
-    stop_flag: Option<Arc<AtomicBool>>,
+    generation: Arc<AtomicU64>,
+    shutdown_tx: Option<watch::Sender<bool>>,
+    worker_handle: Option<std::thread::JoinHandle<()>>,
     connected: Arc<AtomicBool>,
+    halted: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
 }
 
@@ -87,14 +137,29 @@ impl P2PTunnelManager {
         Self {
             active_key: String::new(),
             local_port: DEFAULT_LOCAL_PORT,
-            stop_flag: None,
+            generation: Arc::new(AtomicU64::new(0)),
+            shutdown_tx: None,
+            worker_handle: None,
             connected: Arc::new(AtomicBool::new(false)),
+            halted: Arc::new(AtomicBool::new(false)),
             status: Arc::new(Mutex::new("Idle".to_string())),
         }
     }
 
     pub fn is_connected_handle(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.connected)
+    }
+
+    pub fn is_halted(&self) -> bool {
+        self.halted.load(Ordering::Acquire)
+            || self
+                .worker_handle
+                .as_ref()
+                .is_none_or(|h| h.is_finished())
+    }
+
+    pub fn clear_active_key(&mut self) {
+        self.active_key.clear();
     }
 
     pub fn status_text(&self) -> String {
@@ -105,10 +170,15 @@ impl P2PTunnelManager {
     }
 
     pub fn stop(&mut self) {
-        if let Some(flag) = self.stop_flag.take() {
-            flag.store(true, Ordering::SeqCst);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(true);
+        }
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
         }
         self.connected.store(false, Ordering::Release);
+        self.halted.store(false, Ordering::Release);
         self.active_key.clear();
         if let Ok(mut s) = self.status.lock() {
             *s = "Stopped".to_string();
@@ -129,88 +199,202 @@ impl P2PTunnelManager {
         }
 
         let key = format!("{}|{}|{}|{}", serial_clean, username, password, remote_port);
-        if self.active_key == key && self.stop_flag.is_some() {
+        if self.active_key == key
+            && self.shutdown_tx.is_some()
+            && !self.is_halted()
+            && self.local_port > 0
+        {
             return self.local_port;
         }
 
         self.stop();
-        self.active_key = key;
-        self.connected.store(false, Ordering::Release);
 
         // Bind a persistent local port (prefer 15540, fallback to OS-assigned)
-        let std_listener = std::net::TcpListener::bind(("127.0.0.1", DEFAULT_LOCAL_PORT))
+        let std_listener = match std::net::TcpListener::bind(("127.0.0.1", DEFAULT_LOCAL_PORT))
             .or_else(|_| std::net::TcpListener::bind(("127.0.0.1", 0)))
-            .expect("Failed to bind local P2P tunnel listener");
-        let _ = std_listener.set_nonblocking(true);
-        self.local_port = std_listener
-            .local_addr()
-            .map(|a| a.port())
-            .unwrap_or(DEFAULT_LOCAL_PORT);
+        {
+            Ok(l) => l,
+            Err(e) => {
+                self.local_port = 0;
+                self.halted.store(true, Ordering::Release);
+                if let Ok(mut s) = self.status.lock() {
+                    *s = format!("Port bind failed ({})", e);
+                }
+                return 0;
+            }
+        };
 
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        self.stop_flag = Some(stop_flag.clone());
-
-        let connected_flag = self.connected.clone();
-        let status = self.status.clone();
-        if let Ok(mut s) = status.lock() {
-            *s = "Cloud P2P Connecting...".to_string();
+        if let Err(e) = std_listener.set_nonblocking(true) {
+            self.local_port = 0;
+            self.halted.store(true, Ordering::Release);
+            if let Ok(mut s) = self.status.lock() {
+                *s = format!("Socket setup failed ({})", e);
+            }
+            return 0;
         }
+
+        self.local_port = match std_listener.local_addr() {
+            Ok(addr) => addr.port(),
+            Err(e) => {
+                self.local_port = 0;
+                self.halted.store(true, Ordering::Release);
+                if let Ok(mut s) = self.status.lock() {
+                    *s = format!("Local addr error ({})", e);
+                }
+                return 0;
+            }
+        };
+
+        let my_gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
+        self.active_key = key;
+        self.shutdown_tx = Some(shutdown_tx);
+        self.connected.store(false, Ordering::Release);
+        self.halted.store(false, Ordering::Release);
+
+        let generation = Arc::clone(&self.generation);
+        let connected_flag = Arc::clone(&self.connected);
+        let halted_flag = Arc::clone(&self.halted);
+        let status = Arc::clone(&self.status);
+        set_status_if_current(&status, &generation, my_gen, "Cloud P2P Connecting...");
 
         let user_owned = username.to_string();
         let pass_owned = password.to_string();
 
-        std::thread::Builder::new()
+        let spawn_res = std::thread::Builder::new()
             .name("dahua-p2p-tunnel".to_string())
             .spawn(move || {
-                let rt = tokio::runtime::Builder::new_multi_thread()
+                let rt = match tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .enable_all()
                     .build()
-                    .expect("Failed to build P2P Tokio runtime");
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        halted_flag.store(true, Ordering::Release);
+                        set_status_if_current(
+                            &status,
+                            &generation,
+                            my_gen,
+                            format!("P2P runtime error ({})", e),
+                        );
+                        return;
+                    }
+                };
 
                 rt.block_on(async move {
-                    let Ok(listener) = TcpListener::from_std(std_listener) else {
-                        return;
-                    };
-                    let listener = Arc::new(listener);
-
-                    while !stop_flag.load(Ordering::SeqCst) {
-                        connected_flag.store(false, Ordering::Release);
-                        if let Ok(mut s) = status.lock() {
-                            *s = "Cloud P2P Handshake...".to_string();
+                    let listener = match TcpListener::from_std(std_listener) {
+                        Ok(l) => Arc::new(l),
+                        Err(e) => {
+                            halted_flag.store(true, Ordering::Release);
+                            set_status_if_current(
+                                &status,
+                                &generation,
+                                my_gen,
+                                format!("P2P listener error ({})", e),
+                            );
+                            return;
                         }
+                    };
 
-                        match run_tunnel_session(
-                            listener.clone(),
-                            &serial_clean,
-                            &user_owned,
-                            &pass_owned,
+                    let mut consecutive_errors: u32 = 0;
+
+                    while !*shutdown_rx.borrow() {
+                        set_connected_if_current(&connected_flag, &generation, my_gen, false);
+                        set_status_if_current(
+                            &status,
+                            &generation,
+                            my_gen,
+                            "Cloud P2P Handshake...",
+                        );
+
+                        let session_established = Arc::new(AtomicBool::new(false));
+                        let ctx = TunnelSessionCtx {
+                            listener: Arc::clone(&listener),
+                            serial: serial_clean.clone(),
+                            username: user_owned.clone(),
+                            password: pass_owned.clone(),
                             remote_port,
-                            stop_flag.clone(),
-                            connected_flag.clone(),
-                            status.clone(),
-                        )
-                        .await
-                        {
+                            my_gen,
+                            generation: Arc::clone(&generation),
+                            connected_flag: Arc::clone(&connected_flag),
+                            status: Arc::clone(&status),
+                            session_established: Arc::clone(&session_established),
+                        };
+
+                        match run_tunnel_session(&ctx, shutdown_rx.clone()).await {
                             Ok(()) => break,
                             Err(e) => {
-                                connected_flag.store(false, Ordering::Release);
-                                if stop_flag.load(Ordering::SeqCst) {
+                                set_connected_if_current(
+                                    &connected_flag,
+                                    &generation,
+                                    my_gen,
+                                    false,
+                                );
+                                if *shutdown_rx.borrow() {
                                     break;
                                 }
-                                if let Ok(mut s) = status.lock() {
-                                    *s = format!("Cloud P2P Retry ({})", e);
+                                if is_p2p_auth_rejection(&e) {
+                                    halted_flag.store(true, Ordering::Release);
+                                    set_status_if_current(
+                                        &status,
+                                        &generation,
+                                        my_gen,
+                                        "Auth failed (401) - check password in Settings",
+                                    );
+                                    break;
                                 }
-                                time::sleep(Duration::from_secs(2)).await;
+                                if session_established.load(Ordering::Acquire) {
+                                    consecutive_errors = 1;
+                                } else {
+                                    consecutive_errors = consecutive_errors.saturating_add(1);
+                                }
+                                let delay_secs = match consecutive_errors {
+                                    1 => 2,
+                                    2 => 4,
+                                    3 => 8,
+                                    4 => 15,
+                                    _ => 30,
+                                };
+                                set_status_if_current(
+                                    &status,
+                                    &generation,
+                                    my_gen,
+                                    format!("Cloud P2P Retry ({})", e),
+                                );
+                                tokio::select! {
+                                    biased;
+                                    _ = wait_for_shutdown(&mut shutdown_rx) => break,
+                                    _ = time::sleep(Duration::from_secs(delay_secs)) => {}
+                                }
                             }
                         }
                     }
-                    connected_flag.store(false, Ordering::Release);
-                });
-            })
-            .ok();
 
-        self.local_port
+                    set_connected_if_current(&connected_flag, &generation, my_gen, false);
+                    drop(listener);
+                });
+
+                rt.shutdown_background();
+            });
+
+        match spawn_res {
+            Ok(handle) => {
+                self.worker_handle = Some(handle);
+                self.local_port
+            }
+            Err(e) => {
+                self.shutdown_tx = None;
+                self.active_key.clear();
+                self.local_port = 0;
+                self.halted.store(true, Ordering::Release);
+                if let Ok(mut s) = self.status.lock() {
+                    *s = format!("Thread spawn error ({})", e);
+                }
+                0
+            }
+        }
     }
 }
 
@@ -220,82 +404,125 @@ impl Drop for P2PTunnelManager {
     }
 }
 
-async fn run_tunnel_session(
+struct TunnelSessionCtx {
     listener: Arc<TcpListener>,
-    serial: &str,
-    username: &str,
-    password: &str,
+    serial: String,
+    username: String,
+    password: String,
     remote_port: u16,
-    stop_flag: Arc<AtomicBool>,
+    my_gen: u64,
+    generation: Arc<AtomicU64>,
     connected_flag: Arc<AtomicBool>,
     status: Arc<Mutex<String>>,
+    session_established: Arc<AtomicBool>,
+}
+
+async fn run_tunnel_session(
+    ctx: &TunnelSessionCtx,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<(), String> {
     let socket = UdpSocket::bind("0.0.0.0:0")
         .await
         .map_err(|e| e.to_string())?;
 
-    let (socket, session) = time::timeout(
+    let handshake_fut = time::timeout(
         Duration::from_secs(12),
-        p2p_handshake(socket, serial, username, password),
-    )
-    .await
-    .map_err(|_| "Handshake timeout".to_string())??;
+        p2p_handshake(
+            socket,
+            &ctx.serial,
+            &ctx.username,
+            &ctx.password,
+            shutdown_rx.clone(),
+        ),
+    );
+    let (socket, session) = tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown_rx) => return Ok(()),
+        res = handshake_fut => res.map_err(|_| "Handshake timeout".to_string())??,
+    };
 
     // Drain any stale CLOSE-WAIT sockets queued before the handshake finished
     while let Ok(Ok((stale_client, _))) =
-        time::timeout(Duration::from_millis(5), listener.accept()).await
+        time::timeout(Duration::from_millis(2), ctx.listener.accept()).await
     {
         if is_tcp_established(&stale_client) {
             drop(stale_client);
         }
     }
 
-    connected_flag.store(true, Ordering::Release);
-    if let Ok(mut s) = status.lock() {
-        *s = "Cloud P2P Connected".to_string();
+    if *shutdown_rx.borrow() {
+        return Ok(());
     }
 
-    let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(256);
+    ctx.session_established.store(true, Ordering::Release);
+    set_connected_if_current(&ctx.connected_flag, &ctx.generation, ctx.my_gen, true);
+    set_status_if_current(
+        &ctx.status,
+        &ctx.generation,
+        ctx.my_gen,
+        "Cloud P2P Connected",
+    );
+
+    let (dh_tx, dh_rx) = mpsc::channel::<PTCPEvent>(512);
     let session = Arc::new(Mutex::new(session));
 
     let channels = Arc::new(Mutex::new(HashMap::<u32, mpsc::Sender<Vec<u8>>>::new()));
     let conn_channels = Arc::new(Mutex::new(HashMap::<u32, oneshot::Sender<bool>>::new()));
 
     let reader_sock = Arc::new(socket);
-    let writer_sock = reader_sock.clone();
+    let writer_sock = Arc::clone(&reader_sock);
 
-    let session_reader = session.clone();
-    let channels_reader = channels.clone();
-    let conn_channels_reader = conn_channels.clone();
+    let session_reader = Arc::clone(&session);
+    let channels_reader = Arc::clone(&channels);
+    let conn_channels_reader = Arc::clone(&conn_channels);
 
     let session_alive = Arc::new(AtomicBool::new(true));
-    let alive_hb = session_alive.clone();
-    let alive_reader = session_alive.clone();
+    let alive_hb = Arc::clone(&session_alive);
+    let alive_reader = Arc::clone(&session_alive);
+    let session_dead_notify = Arc::new(Notify::new());
+    let dead_notify_reader = Arc::clone(&session_dead_notify);
 
     let hb_tx = dh_tx.clone();
-    let stop_hb = stop_flag.clone();
-    tokio::spawn(async move {
-        while !stop_hb.load(Ordering::SeqCst) && alive_hb.load(Ordering::SeqCst) {
-            time::sleep(Duration::from_secs(5)).await;
+    let mut hb_shutdown = shutdown_rx.clone();
+    let hb_handle = tokio::spawn(async move {
+        while alive_hb.load(Ordering::Acquire) {
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut hb_shutdown) => break,
+                _ = time::sleep(Duration::from_secs(5)) => {}
+            }
             if hb_tx.send(PTCPEvent::Heartbeat).await.is_err() {
                 break;
             }
         }
     });
 
+    let mut writer_shutdown = shutdown_rx.clone();
+    let remote_port_u32 = ctx.remote_port as u32;
     let writer_handle = tokio::spawn(async move {
-        dh_writer(session, writer_sock, dh_rx, remote_port as u32).await;
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut writer_shutdown) => {}
+            _ = dh_writer(session, writer_sock, dh_rx, remote_port_u32) => {}
+        }
     });
 
+    let mut reader_shutdown = shutdown_rx.clone();
+    let dh_tx_reader = dh_tx.clone();
     let reader_handle = tokio::spawn(async move {
-        let res = dh_reader(
-            session_reader,
-            reader_sock,
-            channels_reader,
-            conn_channels_reader,
-        )
-        .await;
-        alive_reader.store(false, Ordering::SeqCst);
+        let res = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut reader_shutdown) => Ok(()),
+            r = dh_reader(
+                session_reader,
+                reader_sock,
+                channels_reader,
+                conn_channels_reader,
+                dh_tx_reader,
+            ) => r,
+        };
+        alive_reader.store(false, Ordering::Release);
+        dead_notify_reader.notify_waiters();
         res
     });
 
@@ -303,37 +530,60 @@ async fn run_tunnel_session(
     // never interleaves Bind sequence numbers over the UDP relay
     let bind_semaphore = Arc::new(Semaphore::new(1));
     let consecutive_bind_failures = Arc::new(AtomicU32::new(0));
+    let mut health_tick = time::interval(Duration::from_millis(250));
+    health_tick.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
 
     loop {
-        if stop_flag.load(Ordering::SeqCst) {
-            connected_flag.store(false, Ordering::Release);
-            writer_handle.abort();
-            reader_handle.abort();
-            if let Ok(mut map) = channels.lock() {
-                map.clear();
+        let accept_res = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => {
+                set_connected_if_current(&ctx.connected_flag, &ctx.generation, ctx.my_gen, false);
+                hb_handle.abort();
+                writer_handle.abort();
+                reader_handle.abort();
+                if let Ok(mut map) = channels.lock() {
+                    map.clear();
+                }
+                if let Ok(mut map) = conn_channels.lock() {
+                    map.clear();
+                }
+                return Ok(());
             }
-            if let Ok(mut map) = conn_channels.lock() {
-                map.clear();
+            _ = session_dead_notify.notified() => {
+                set_connected_if_current(&ctx.connected_flag, &ctx.generation, ctx.my_gen, false);
+                hb_handle.abort();
+                writer_handle.abort();
+                reader_handle.abort();
+                if let Ok(mut map) = channels.lock() {
+                    map.clear();
+                }
+                if let Ok(mut map) = conn_channels.lock() {
+                    map.clear();
+                }
+                return Err("Relay session closed".to_string());
             }
-            return Ok(());
-        }
-        if !session_alive.load(Ordering::SeqCst)
-            || consecutive_bind_failures.load(Ordering::Acquire) >= 12
-        {
-            connected_flag.store(false, Ordering::Release);
-            writer_handle.abort();
-            reader_handle.abort();
-            if let Ok(mut map) = channels.lock() {
-                map.clear();
+            _ = health_tick.tick() => {
+                if !session_alive.load(Ordering::Acquire)
+                    || consecutive_bind_failures.load(Ordering::Acquire) >= 12
+                {
+                    set_connected_if_current(&ctx.connected_flag, &ctx.generation, ctx.my_gen, false);
+                    hb_handle.abort();
+                    writer_handle.abort();
+                    reader_handle.abort();
+                    if let Ok(mut map) = channels.lock() {
+                        map.clear();
+                    }
+                    if let Ok(mut map) = conn_channels.lock() {
+                        map.clear();
+                    }
+                    return Err("Relay session closed".to_string());
+                }
+                continue;
             }
-            if let Ok(mut map) = conn_channels.lock() {
-                map.clear();
-            }
-            return Err("Relay session closed".to_string());
-        }
+            res = ctx.listener.accept() => res,
+        };
 
-        let accept_res = time::timeout(Duration::from_millis(300), listener.accept()).await;
-        let Ok(Ok((client, _addr))) = accept_res else {
+        let Ok((client, _addr)) = accept_res else {
             continue;
         };
 
@@ -343,21 +593,30 @@ async fn run_tunnel_session(
         }
 
         let dh_tx_client = dh_tx.clone();
-        let channels_client = channels.clone();
-        let conn_channels_client = conn_channels.clone();
-        let sem_clone = bind_semaphore.clone();
-        let bind_failures = consecutive_bind_failures.clone();
-        let alive_flag = session_alive.clone();
+        let channels_client = Arc::clone(&channels);
+        let conn_channels_client = Arc::clone(&conn_channels);
+        let sem_clone = Arc::clone(&bind_semaphore);
+        let bind_failures = Arc::clone(&consecutive_bind_failures);
+        let alive_flag = Arc::clone(&session_alive);
+        let mut client_shutdown = shutdown_rx.clone();
 
         tokio::spawn(async move {
-            let Ok(_permit) = sem_clone.acquire_owned().await else {
-                return;
+            let permit = tokio::select! {
+                biased;
+                _ = wait_for_shutdown(&mut client_shutdown) => return,
+                res = sem_clone.acquire_owned() => match res {
+                    Ok(p) => p,
+                    Err(_) => return,
+                },
             };
-            if !alive_flag.load(Ordering::SeqCst) || !is_tcp_established(&client) {
+            if !alive_flag.load(Ordering::Acquire)
+                || *client_shutdown.borrow()
+                || !is_tcp_established(&client)
+            {
                 return;
             }
 
-            let (tx, rx) = mpsc::channel::<Vec<u8>>(256);
+            let (tx, rx) = mpsc::channel::<Vec<u8>>(REALM_CHANNEL_CAPACITY);
             let (conn_tx, mut conn_rx) = oneshot::channel::<bool>();
 
             let realm_id = rand::random::<u32>();
@@ -370,7 +629,7 @@ async fn run_tunnel_session(
 
             let mut bound = false;
             for _attempt in 0..3 {
-                if !is_tcp_established(&client) {
+                if *client_shutdown.borrow() || !is_tcp_established(&client) {
                     break;
                 }
                 if dh_tx_client
@@ -380,7 +639,12 @@ async fn run_tunnel_session(
                 {
                     break;
                 }
-                match time::timeout(Duration::from_millis(2000), &mut conn_rx).await {
+                let wait_res = tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut client_shutdown) => break,
+                    res = time::timeout(Duration::from_millis(2000), &mut conn_rx) => res,
+                };
+                match wait_res {
                     Ok(Ok(true)) => {
                         bound = true;
                         break;
@@ -397,22 +661,35 @@ async fn run_tunnel_session(
                 if let Ok(mut map) = conn_channels_client.lock() {
                     map.remove(&realm_id);
                 }
-                let _ = dh_tx_client.send(PTCPEvent::Disconnect(realm_id)).await;
-                if is_tcp_established(&client) {
+                let _ = dh_tx_client.try_send(PTCPEvent::Disconnect(realm_id));
+                if !*client_shutdown.borrow() && is_tcp_established(&client) {
                     bind_failures.fetch_add(1, Ordering::AcqRel);
                 }
                 return;
             }
 
             bind_failures.store(0, Ordering::Release);
-            drop(_permit);
+            drop(permit);
 
             let (reader, writer) = client.into_split();
+            let reader_shutdown = client_shutdown.clone();
+            let writer_shutdown = client_shutdown;
+            let dh_tx_writer = dh_tx_client.clone();
+            let channels_writer = Arc::clone(&channels_client);
+
             tokio::spawn(async move {
-                process_reader(reader, realm_id, dh_tx_client).await;
+                process_reader(reader, realm_id, dh_tx_client, reader_shutdown).await;
             });
             tokio::spawn(async move {
-                process_writer(writer, rx).await;
+                process_writer(
+                    writer,
+                    rx,
+                    realm_id,
+                    channels_writer,
+                    dh_tx_writer,
+                    writer_shutdown,
+                )
+                .await;
             });
         });
     }
@@ -507,6 +784,20 @@ fn get_auth(username: &str, key: &[u8], nonce: &str, randsalt: &str, payload: &s
 }
 
 async fn p2p_handshake(
+    socket: UdpSocket,
+    serial: &str,
+    username: &str,
+    password: &str,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(UdpSocket, PTCPSession), String> {
+    tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut shutdown_rx) => Err("Tunnel stopped".to_string()),
+        res = p2p_handshake_inner(socket, serial, username, password) => res,
+    }
+}
+
+async fn p2p_handshake_inner(
     socket: UdpSocket,
     serial: &str,
     username: &str,
@@ -649,6 +940,9 @@ async fn p2p_handshake(
         res = dh_read_raw(&socket).await?;
     }
 
+    if res.code == 401 || res.code == 403 {
+        return Err(format!("AUTH_401: P2P auth error {} ({})", res.code, res.status));
+    }
     if res.code >= 400 {
         return Err(format!("P2P auth error {} ({})", res.code, res.status));
     }
@@ -771,7 +1065,7 @@ async fn dh_request(
     let mut hasher = sha1::Sha1::new();
     hasher.update(pwd);
     let hash_digest = hasher.finalize();
-    let digest = base64::engine::general_purpose::STANDARD.encode(&hash_digest);
+    let digest = base64::engine::general_purpose::STANDARD.encode(hash_digest);
 
     *seq += 1;
 
@@ -805,6 +1099,9 @@ async fn dh_read_raw(socket: &UdpSocket) -> Result<DHResponse, String> {
 
 async fn dh_read(socket: &UdpSocket) -> Result<DHResponse, String> {
     let res = dh_read_raw(socket).await?;
+    if res.code == 401 || res.code == 403 {
+        return Err(format!("AUTH_401: Signaling HTTP {} ({})", res.code, res.status));
+    }
     if res.code >= 300 {
         return Err(format!("Signaling HTTP {} ({})", res.code, res.status));
     }
@@ -818,7 +1115,7 @@ pub enum PTCPEvent {
     Data(u32, Vec<u8>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PTCPPayload {
     pub realm: u32,
     pub data: Vec<u8>,
@@ -831,9 +1128,15 @@ impl PTCPPayload {
         }
         let header = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let length = (header & 0xFFFF) as usize;
+        if data.len() < 12 + length {
+            return Err(format!(
+                "Truncated PTCPPayload datagram: expected {} bytes, got {}",
+                12 + length,
+                data.len()
+            ));
+        }
         let realm = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        let end = cmp::min(12 + length, data.len());
-        let payload_data = data[12..end].to_vec();
+        let payload_data = data[12..12 + length].to_vec();
         Ok(Self {
             realm,
             data: payload_data,
@@ -1148,6 +1451,9 @@ impl PTCPSession {
                 ready.push(next_pkt);
             }
 
+            let cur_recv = self.recv;
+            self.reorder_buf.retain(|&s, _| sequence_is_after(s, cur_recv));
+
             if self.reorder_buf.is_empty() {
                 self.gap_since = None;
             } else {
@@ -1156,6 +1462,12 @@ impl PTCPSession {
 
             let ack = self.send(PTCPBody::Empty);
             return (ready, Some(ack), Vec::new());
+        }
+
+        // Ignore partially overlapping retransmissions whose start precedes self.recv
+        if !sequence_is_after(packet.sent, self.recv) {
+            self.rmid = packet.lmid;
+            return (Vec::new(), Some(self.send(PTCPBody::Empty)), Vec::new());
         }
 
         // Out-of-order future packet (e.g. small trailing keyframe fragment arriving ahead of full-MTU chunks)
@@ -1170,6 +1482,9 @@ impl PTCPSession {
             .unwrap_or(Duration::ZERO);
 
         if self.reorder_buf.len() > 32 || gap_elapsed > Duration::from_millis(20) {
+            let cur_recv = self.recv;
+            self.reorder_buf.retain(|&s, _| sequence_is_after(s, cur_recv));
+
             let next_sent = self
                 .reorder_buf
                 .keys()
@@ -1183,6 +1498,9 @@ impl PTCPSession {
                     self.rmid = next_pkt.lmid;
                     ready.push(next_pkt);
                 }
+                let updated_recv = self.recv;
+                self.reorder_buf
+                    .retain(|&s, _| sequence_is_after(s, updated_recv));
                 self.gap_since = if self.reorder_buf.is_empty() {
                     None
                 } else {
@@ -1204,7 +1522,7 @@ async fn ptcp_request(socket: &UdpSocket, packet: PTCPPacket) -> Result<(), Stri
 }
 
 async fn ptcp_read(socket: &UdpSocket) -> Result<PTCPPacket, String> {
-    let mut buf = [0u8; 8192];
+    let mut buf = [0u8; 16384];
     loop {
         match socket.recv(&mut buf).await {
             Ok(n) => {
@@ -1228,10 +1546,35 @@ async fn ptcp_read(socket: &UdpSocket) -> Result<PTCPPacket, String> {
 async fn process_writer(
     mut writer: tokio::net::tcp::OwnedWriteHalf,
     mut rx: mpsc::Receiver<Vec<u8>>,
+    realm_id: u32,
+    channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
+    dh_tx: mpsc::Sender<PTCPEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    while let Some(data) = rx.recv().await {
-        if writer.write_all(&data).await.is_err() {
+    loop {
+        let maybe_data = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+            msg = rx.recv() => msg,
+        };
+        let Some(data) = maybe_data else {
             break;
+        };
+        let write_res = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => return,
+            res = time::timeout(Duration::from_secs(3), writer.write_all(&data)) => res,
+        };
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => {
+                if let Ok(mut map) = channels.lock() {
+                    map.remove(&realm_id);
+                }
+                let _ = dh_tx.try_send(PTCPEvent::Disconnect(realm_id));
+                let _ = writer.shutdown().await;
+                break;
+            }
         }
     }
 }
@@ -1240,22 +1583,30 @@ async fn process_reader(
     mut reader: tokio::net::tcp::OwnedReadHalf,
     realm_id: u32,
     dh_tx: mpsc::Sender<PTCPEvent>,
+    mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let mut buf = [0u8; 4096];
     loop {
-        let n = match reader.read(&mut buf).await {
+        let read_res = tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => break,
+            res = reader.read(&mut buf) => res,
+        };
+        let n = match read_res {
             Ok(0) | Err(_) => {
-                let _ = dh_tx.send(PTCPEvent::Disconnect(realm_id)).await;
+                let _ = dh_tx.try_send(PTCPEvent::Disconnect(realm_id));
                 break;
             }
             Ok(n) => n,
         };
-        if dh_tx
-            .send(PTCPEvent::Data(realm_id, buf[0..n].to_vec()))
-            .await
-            .is_err()
-        {
-            break;
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(&mut shutdown_rx) => break,
+            res = dh_tx.send(PTCPEvent::Data(realm_id, buf[0..n].to_vec())) => {
+                if res.is_err() {
+                    break;
+                }
+            }
         }
     }
 }
@@ -1295,6 +1646,7 @@ async fn dh_reader(
     socket: Arc<UdpSocket>,
     channels: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>>,
     conn_channels: Arc<Mutex<HashMap<u32, oneshot::Sender<bool>>>>,
+    dh_tx: mpsc::Sender<PTCPEvent>,
 ) -> Result<(), String> {
     loop {
         let raw_pkt = time::timeout(Duration::from_secs(20), ptcp_read(&socket))
@@ -1338,14 +1690,94 @@ async fn dh_reader(
             if let PTCPBody::Payload(p) = packet.body {
                 let tx = channels.lock().ok().and_then(|map| map.get(&p.realm).cloned());
                 if let Some(tx) = tx {
-                    if tx.send(p.data).await.is_err() {
-                        if let Ok(mut map) = channels.lock() {
-                            map.remove(&p.realm);
+                    if tx.try_send(p.data).is_err() {
+                        let removed = channels
+                            .lock()
+                            .ok()
+                            .and_then(|mut map| map.remove(&p.realm))
+                            .is_some();
+                        if removed {
+                            let _ = dh_tx.try_send(PTCPEvent::Disconnect(p.realm));
                         }
                     }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ptcp_payload_rejects_truncated_datagram() {
+        let valid = PTCPPayload {
+            realm: 42,
+            data: b"hello_rtsp".to_vec(),
+        };
+        let raw = valid.serialize();
+        assert_eq!(PTCPPayload::parse(&raw).unwrap(), valid);
+
+        // Truncate 3 bytes off the end: must return Err instead of silently advancing recv
+        let truncated = &raw[..raw.len() - 3];
+        assert!(PTCPPayload::parse(truncated).is_err());
+    }
+
+    #[test]
+    fn test_ptcp_session_prunes_stale_reorder_keys() {
+        let mut sess = PTCPSession::new();
+        sess.recv = 100;
+
+        let make_payload_pkt = |sent: u32, payload_bytes: usize| PTCPPacket {
+            sent,
+            recv: 0,
+            pid: 1,
+            lmid: 1,
+            rmid: 0,
+            body: PTCPBody::Payload(PTCPPayload {
+                realm: 7,
+                data: vec![0xAA; payload_bytes], // body.len() == payload_bytes + 12
+            }),
+            duplicate: false,
+        };
+
+        // Out-of-order packet starting at 120 (len = 8 + 12 = 20, end = 140)
+        let (ready1, _, _) = sess.recv_ordered(make_payload_pkt(120, 8));
+        assert!(ready1.is_empty());
+        assert_eq!(sess.reorder_buf.len(), 1);
+
+        // Coalesced retransmission starting at 100 covering up to 160 (len = 48 + 12 = 60)
+        let (ready2, _, _) = sess.recv_ordered(make_payload_pkt(100, 48));
+        assert_eq!(ready2.len(), 1);
+        assert_eq!(sess.recv, 160);
+        // Stale key 120 (< 160) MUST have been pruned so gap_since is disarmed and recv never jumps backward
+        assert!(sess.reorder_buf.is_empty());
+        assert!(sess.gap_since.is_none());
+    }
+
+    #[test]
+    fn test_generation_guard_prevents_stale_clobber() {
+        let connected = AtomicBool::new(true);
+        let generation = AtomicU64::new(2);
+        let status = Mutex::new("Cloud P2P Connected".to_string());
+
+        // Stale generation 1 tries to clobber connected=false and status
+        set_connected_if_current(&connected, &generation, 1, false);
+        set_status_if_current(&status, &generation, 1, "Stopped");
+        assert!(connected.load(Ordering::Acquire));
+        assert_eq!(status.lock().unwrap().as_str(), "Cloud P2P Connected");
+
+        // Current generation 2 updates cleanly
+        set_connected_if_current(&connected, &generation, 2, false);
+        assert!(!connected.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn test_ipv6_is_lan_reachable_no_panic_on_raw_literal() {
+        // Unreachable port on loopback IPv6 literal should return false cleanly without failing parse
+        assert!(!is_lan_reachable("::1", 1, 20));
+        assert!(!is_lan_reachable("[::1]", 1, 20));
     }
 }
 

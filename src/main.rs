@@ -54,8 +54,14 @@ fn main() -> eframe::Result<()> {
         return Ok(());
     }
 
+    let app_id = if std::env::var_os("SNAP").is_some() {
+        "nvr-command-center_nvr-command-center"
+    } else {
+        "rtsp-camera-viewer"
+    };
+
     let mut viewport = egui::ViewportBuilder::default()
-        .with_app_id("rtsp-camera-viewer")
+        .with_app_id(app_id)
         .with_title(format!(
             "NVR Command Center v{} - {} Cameras ({})",
             env!("CARGO_PKG_VERSION"),

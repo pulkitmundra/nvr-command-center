@@ -1,6 +1,6 @@
 # NVR Command Center v2.1 (Native Rust + GPU + Cloud P2P)
 
-[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
+[![Version](https://img.shields.io/badge/version-2.1.1-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
 [![Snap Store](https://img.shields.io/badge/Snap_Store-nvr--command--center-82BEA0?logo=snapcraft&logoColor=white)](https://snapcraft.io/nvr-command-center)
 [![Rust](https://img.shields.io/badge/Rust-Native_GPU-orange?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Ubuntu-E95420?logo=ubuntu&logoColor=white)](https://github.com/pulkitmundra/nvr-command-center)
@@ -136,10 +136,10 @@ To bind a global Ubuntu/GNOME keyboard shortcut (e.g. `Ctrl+Alt+C` or `Super+C`)
 ## Frequently Asked Questions (Linux CCTV, NVR & Cloud P2P Viewer)
 
 ### How do I run Dahua SmartPSS / DMSS / Easy4ip or CP Plus KVMS Pro / gCMOB on Ubuntu & Linux?
-Proprietary Windows/mobile CCTV apps like **Dahua SmartPSS**, **DMSS**, **CP Plus KVMS Pro (`gCMOB`)**, **Amcrest Surveillance Pro**, and **Hikvision iVMS-4200** do not provide native Linux desktop clients and often crash or lag under Wine. **NVR Command Center** is a native Rust + `wgpu` Linux replacement (`sudo snap install nvr-command-center`) that connects directly via LAN RTSP or remote **Cloud P2P Device Serial Number (`RTSP_P2P_SERIAL`)** with zero port-forwarding required.
+Proprietary Windows/mobile CCTV apps like **Dahua SmartPSS**, **DMSS**, **CP Plus KVMS Pro (`gCMOB`)**, **Amcrest Surveillance Pro**, and **Hikvision iVMS-4200** do not provide native Linux desktop clients and often crash or lag under Wine. **NVR Command Center** is a native Rust (`eframe`/`egui` OpenGL `glow`) Linux replacement (`sudo snap install nvr-command-center`) that connects directly via LAN RTSP or remote **Cloud P2P Device Serial Number (`RTSP_P2P_SERIAL`)** with zero port-forwarding required.
 
 ### How do I view RTSP IP cameras with hardware acceleration (`VAAPI` / `NVDEC`) on Linux?
-Set `HWACCEL_MODE="auto"` (default) in the in-app **Settings (`⚙`)** modal or `config.env`. Each camera worker automatically negotiates GPU hardware decoding (`VAAPI` on Intel/AMD or `NVDEC` on NVIDIA) with seamless fallback to multi-threaded software decoding, rendering up to 32 `H.265` (`HEVC`) / `H.264` camera channels at 60 FPS on a single `wgpu` shader surface.
+Set `HWACCEL_MODE="auto"` (default) in the in-app **Settings** modal or `.env`. Each camera worker automatically negotiates GPU hardware decoding (`VAAPI` on Intel/AMD or `NVDEC` on NVIDIA) with seamless fallback to multi-threaded software decoding, rendering up to 32 `H.265` (`HEVC`) / `H.264` camera channels at 60 FPS on a single `eframe`/`egui` OpenGL (`glow`) shader surface.
 
 ---
 

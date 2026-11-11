@@ -1,11 +1,14 @@
 name: nvr-command-center
 title: NVR Command Center (RTSP & CCTV Viewer)
-version: 2.1.0
+adopt-info: nvr-command-center
 license: MIT
 website: https://github.com/pulkitmundra/nvr-command-center
 source-code: https://github.com/pulkitmundra/nvr-command-center
 issues: https://github.com/pulkitmundra/nvr-command-center/issues
 contact: https://github.com/pulkitmundra/nvr-command-center/issues
+donation:
+  - https://buymeacoffee.com/pulkitmundra
+  - https://github.com/sponsors/pulkitmundra
 summary: GPU RTSP IP Camera, CCTV, NVR/DVR/XVR & Cloud P2P Viewer (Dahua, Hikvision)
 description: |
   NVR Command Center is an ultra-low-latency, GPU-accelerated multi-camera
@@ -63,6 +66,12 @@ platforms:
     build-on: [amd64]
     build-for: [amd64]
 
+plugs:
+  gpu-2404:
+    interface: content
+    target: $SNAP/gpu-2404
+    default-provider: mesa-2404
+
 apps:
   nvr-command-center:
     command: bin/nvr-command-center
@@ -76,6 +85,7 @@ apps:
       - wayland
       - x11
       - opengl
+      - gpu-2404
       - home
 
 parts:
@@ -111,13 +121,18 @@ parts:
       - ca-certificates
     override-build: |
       craftctl default
-      mkdir -p "$CRAFT_PART_INSTALL/bin" "$CRAFT_PART_INSTALL/meta/gui"
+      SNAP_VER="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CRAFT_PART_SRC/Cargo.toml" | head -n 1)"
+      craftctl set version="$SNAP_VER"
+      mkdir -p "$CRAFT_PART_INSTALL/bin" "$CRAFT_PART_INSTALL/meta/gui" "$CRAFT_PART_INSTALL/gpu-2404"
       cp "$CRAFT_PART_SRC/assets/icon.png" "$CRAFT_PART_INSTALL/meta/gui/icon.png"
       cp "$CRAFT_PART_SRC/snap/gui/nvr-command-center.desktop" "$CRAFT_PART_INSTALL/meta/gui/nvr-command-center.desktop"
       cat << 'EOF' > "$CRAFT_PART_INSTALL/bin/nvr-command-center"
       #!/bin/sh
       export PATH="$SNAP/usr/bin:$SNAP/bin:$PATH"
       export LD_LIBRARY_PATH="$SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:$SNAP/usr/lib/x86_64-linux-gnu/pulseaudio:$SNAP/usr/lib/x86_64-linux-gnu/blas:$SNAP/usr/lib/x86_64-linux-gnu/lapack:${LD_LIBRARY_PATH:-}"
+      if [ -x "$SNAP/gpu-2404/bin/gpu-2404-provider-wrapper" ]; then
+        exec "$SNAP/gpu-2404/bin/gpu-2404-provider-wrapper" "$SNAP/bin/rtsp-camera-viewer" "$@"
+      fi
       exec "$SNAP/bin/rtsp-camera-viewer" "$@"
       EOF
       chmod 0755 "$CRAFT_PART_INSTALL/bin/nvr-command-center"

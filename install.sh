@@ -1,5 +1,5 @@
 #!/bin/bash
-# One-command installer for NVR Command Center v2.1.0 (Native Rust + GPU + Cloud P2P)
+# One-command installer for NVR Command Center v2.1.1 (Native Rust + GPU + Cloud P2P)
 
 set -e
 
@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=================================================="
-echo "  NVR Command Center v2.1.0 - Native Rust Installer"
+echo "  NVR Command Center v2.1.1 - Native Rust Installer"
 echo "=================================================="
 
 # 1. Check ffmpeg / ffprobe

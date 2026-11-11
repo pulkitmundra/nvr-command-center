@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch script for RTSP Camera Viewer v2.1.0 (Native Rust + GPU Command Center)
+# Launch script for RTSP Camera Viewer v2.1.1 (Native Rust + GPU Command Center)
 # Supports: start | stop | toggle | status | restart | scan
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -45,7 +45,7 @@ is_running() {
 
 start_viewer() {
     ensure_binary
-    echo "Starting RTSP Camera Viewer v2.1.0..."
+    echo "Starting RTSP Camera Viewer v2.1.1..."
     cd "$SCRIPT_DIR" || exit 1
 
     USER_RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"

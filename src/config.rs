@@ -141,7 +141,7 @@ impl NvrEnvConfig {
     pub fn build_rtsp_url(&self, channel: usize, subtype: u8) -> String {
         let user_enc = percent_encode_userinfo(&self.username);
         let pass_enc = percent_encode_userinfo(&self.password);
-        let host = self.active_host();
+        let host_fmt = format_host_for_url(self.active_host());
         let port = self.active_port();
 
         match self.brand.to_lowercase().as_str() {
@@ -149,14 +149,14 @@ impl NvrEnvConfig {
                 let hik_stream = if subtype == 0 { 1 } else { 2 };
                 format!(
                     "rtsp://{}:{}@{}:{}/Streaming/Channels/{}0{}",
-                    user_enc, pass_enc, host, port, channel, hik_stream
+                    user_enc, pass_enc, host_fmt, port, channel, hik_stream
                 )
             }
             "custom" => self
                 .custom_url_template
                 .replace("{user}", &user_enc)
                 .replace("{password}", &pass_enc)
-                .replace("{host}", host)
+                .replace("{host}", &host_fmt)
                 .replace("{port}", &port.to_string())
                 .replace("{channel}", &channel.to_string())
                 .replace("{subtype}", &subtype.to_string()),
@@ -164,7 +164,7 @@ impl NvrEnvConfig {
                 // Default: Dahua / CP Plus / Amcrest XVR/NVR standard
                 format!(
                     "rtsp://{}:{}@{}:{}/cam/realmonitor?channel={}&subtype={}",
-                    user_enc, pass_enc, host, port, channel, subtype
+                    user_enc, pass_enc, host_fmt, port, channel, subtype
                 )
             }
         }
@@ -174,6 +174,19 @@ impl NvrEnvConfig {
         let mut clone = self.clone();
         clone.password = "***".to_string();
         clone.build_rtsp_url(channel, subtype)
+    }
+}
+
+pub fn format_host_for_url(host: &str) -> String {
+    let trimmed = host.trim();
+    if trimmed.is_empty() || (trimmed.starts_with('[') && trimmed.ends_with(']')) {
+        return trimmed.to_string();
+    }
+    let without_zone = trimmed.split('%').next().unwrap_or(trimmed);
+    if without_zone.parse::<std::net::Ipv6Addr>().is_ok() || trimmed.matches(':').count() >= 2 {
+        format!("[{}]", trimmed)
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -215,42 +228,78 @@ pub fn config_file_path() -> PathBuf {
     expand_tilde("~/.rtsp_viewer/config.json")
 }
 
-pub fn locate_env_file() -> PathBuf {
-    if let Ok(cwd) = std::env::current_dir() {
-        let candidate = cwd.join(".env");
-        if candidate.exists() {
+pub fn is_rtsp_env_file(path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(path) else {
+        return false;
+    };
+    let map = parse_env_content(&content);
+    map.keys()
+        .any(|k| k.starts_with("RTSP_") || k.starts_with("DVR_") || k.starts_with("NVR_"))
+}
+
+fn locate_env_file_from(
+    explicit_override: Option<&str>,
+    snap_common: Option<&str>,
+    user_env: PathBuf,
+    cwd: Option<&Path>,
+    exe: Option<&Path>,
+) -> PathBuf {
+    if let Some(explicit) = explicit_override {
+        let trimmed = explicit.trim();
+        if !trimmed.is_empty() {
+            return expand_tilde(trimmed);
+        }
+    }
+    if let Some(snap) = snap_common {
+        let trimmed = snap.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join(".env");
+        }
+    }
+    if user_env.exists() {
+        return user_env;
+    }
+    if let Some(cwd_dir) = cwd {
+        let candidate = cwd_dir.join(".env");
+        if candidate.is_file() && is_rtsp_env_file(&candidate) {
             return candidate;
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
+    if let Some(exe_path) = exe {
+        if let Some(exe_dir) = exe_path.parent() {
             let direct = exe_dir.join(".env");
-            if direct.exists() {
+            if direct.is_file() && is_rtsp_env_file(&direct) {
                 return direct;
             }
             if let Some(parent) = exe_dir.parent().and_then(|p| p.parent()) {
                 let root_env = parent.join(".env");
-                if root_env.exists() {
+                if root_env.is_file() && is_rtsp_env_file(&root_env) {
                     return root_env;
                 }
             }
         }
     }
-    if let Ok(snap_common) = std::env::var("SNAP_USER_COMMON") {
-        if !snap_common.trim().is_empty() {
-            return PathBuf::from(snap_common.trim()).join(".env");
-        }
-    }
-    let user_env = expand_tilde("~/.rtsp_viewer/.env");
-    if user_env.exists() {
-        return user_env;
-    }
-    if let Ok(cwd) = std::env::current_dir() {
-        if !cwd.starts_with("/snap") && !cwd.starts_with("/usr") && cwd != Path::new("/") {
-            return cwd.join(".env");
-        }
-    }
     user_env
+}
+
+pub fn locate_env_file() -> PathBuf {
+    let explicit = std::env::var("RTSP_ENV_FILE").ok();
+    let snap_common = std::env::var("SNAP_USER_COMMON").ok();
+    let user_env = expand_tilde("~/.rtsp_viewer/.env");
+    if let Some(parent) = user_env.parent() {
+        if parent.exists() {
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+    }
+    let cwd = std::env::current_dir().ok();
+    let exe = std::env::current_exe().ok();
+    locate_env_file_from(
+        explicit.as_deref(),
+        snap_common.as_deref(),
+        user_env,
+        cwd.as_deref(),
+        exe.as_deref(),
+    )
 }
 
 pub fn escape_env_val(val: &str) -> String {
@@ -266,21 +315,49 @@ pub fn escape_env_val(val: &str) -> String {
     out
 }
 
-pub fn unescape_env_val(val: &str) -> String {
-    let mut out = String::with_capacity(val.len());
-    let mut chars = val.chars();
-    while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next_ch) = chars.next() {
-                out.push(next_ch);
-            } else {
-                out.push('\\');
+fn parse_env_value(raw_val: &str) -> String {
+    let trimmed = raw_val.trim_start();
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        let mut out = String::with_capacity(rest.len());
+        let mut chars = rest.chars();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\\' => {
+                    if let Some(next_ch) = chars.next() {
+                        out.push(next_ch);
+                    } else {
+                        out.push('\\');
+                    }
+                }
+                '"' => break,
+                _ => out.push(ch),
             }
-        } else {
-            out.push(ch);
         }
+        return out;
     }
-    out
+
+    if let Some(rest) = trimmed.strip_prefix('\'') {
+        if let Some(end_idx) = rest.find('\'') {
+            return rest[..end_idx].to_string();
+        }
+        return rest.trim_end().to_string();
+    }
+
+    // Unquoted value: strip inline `# ...` comments (at start or preceded by whitespace)
+    let mut cut_idx = None;
+    let mut prev_ws = true;
+    for (idx, ch) in trimmed.char_indices() {
+        if ch == '#' && prev_ws {
+            cut_idx = Some(idx);
+            break;
+        }
+        prev_ws = ch.is_whitespace();
+    }
+    let slice = match cut_idx {
+        Some(idx) => &trimmed[..idx],
+        None => trimmed,
+    };
+    slice.trim().to_string()
 }
 
 pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
@@ -292,14 +369,10 @@ pub fn parse_env_content(content: &str) -> BTreeMap<String, String> {
         }
         let line = line.strip_prefix("export ").unwrap_or(line).trim();
         if let Some((k, v)) = line.split_once('=') {
-            let key = k.trim().to_string();
-            let mut val = v.trim().to_string();
-            if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
-                val = unescape_env_val(&val[1..val.len() - 1]);
-            } else if val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2 {
-                val = val[1..val.len() - 1].to_string();
+            let key = k.trim();
+            if !key.is_empty() {
+                map.insert(key.to_string(), parse_env_value(v));
             }
-            map.insert(key, val);
         }
     }
     map
@@ -368,23 +441,53 @@ pub fn load_env_config(path: &Path) -> NvrEnvConfig {
 
 pub fn write_private_file(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = fs::create_dir_all(parent);
-        }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    if !parent.exists() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+    }
+    if parent.file_name().is_some_and(|n| n == ".rtsp_viewer") {
+        let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
     }
 
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-    file.write_all(content.as_bytes())?;
-    file.sync_all()
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    let tmp_path = parent.join(format!(
+        ".{}.tmp.{}.{:016x}",
+        file_name,
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))?;
+        file.write_all(content.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp_path, path)?;
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        Ok(())
+    })();
+
+    if write_res.is_err() {
+        let _ = fs::remove_file(&tmp_path);
+    }
+    write_res
 }
 
 pub fn save_env_config(path: &Path, cfg: &NvrEnvConfig) -> std::io::Result<()> {
@@ -437,9 +540,6 @@ impl AppConfig {
 
     pub fn save(&self) -> std::io::Result<()> {
         let path = config_file_path();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_string_pretty(self)?;
         write_private_file(&path, &json)
     }
@@ -488,7 +588,7 @@ impl AppConfig {
             "2x6" if n <= 12 => (2, 6),
             _ => {
                 let cols = (n as f64).sqrt().ceil() as usize;
-                let rows = (n + cols - 1) / cols;
+                let rows = n.div_ceil(cols);
                 (rows.max(1), cols.max(1))
             }
         }
@@ -520,7 +620,123 @@ mod tests {
     }
 
     #[test]
-    fn test_dahua_p2p_and_hikvision_url_generation() {
+    fn test_readme_env_snippet_with_inline_comments() {
+        let readme_snippet = r##"
+RTSP_BRAND="dahua"             # "dahua" (Dahua/CP Plus/Amcrest), "hikvision", or "custom"
+RTSP_HOST="192.168.1.100"      # Primary LAN NVR IP
+RTSP_P2P_SERIAL="YOUR_NVR_SN"  # Optional Cloud P2P Serial Number (works on any internet connection!)
+RTSP_USE_CLOUD_P2P="false"     # Auto-activates when LAN NVR IP is unreachable
+RTSP_TAILSCALE_HOST="100.x.y.z"# Optional Tailscale remote IP for 1-click switching
+RTSP_USE_TAILSCALE="false"
+RTSP_PORT="554"
+RTSP_USER="admin"
+RTSP_PASSWORD='p@ss#word_with_hash' # single-quoted value with # inside
+NUM_CAMERAS="12"               # Dynamic 1-32 channels (default: 12 for 3x4 grid)
+IP_CAMERA_START_CHANNEL=10     # Unquoted integer with trailing comment
+DEFAULT_SUBTYPE="1"            # 1 = Sub-Stream (SD), 0 = Main-Stream (HD)
+HWACCEL_MODE="auto"            # "auto" (VAAPI/NVDEC with CPU fallback) or "software"
+"##;
+        let parsed = parse_env_content(readme_snippet);
+        assert_eq!(parsed.get("RTSP_BRAND").map(String::as_str), Some("dahua"));
+        assert_eq!(
+            parsed.get("RTSP_HOST").map(String::as_str),
+            Some("192.168.1.100")
+        );
+        assert_eq!(
+            parsed.get("RTSP_P2P_SERIAL").map(String::as_str),
+            Some("YOUR_NVR_SN")
+        );
+        assert_eq!(
+            parsed.get("RTSP_USE_CLOUD_P2P").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(
+            parsed.get("RTSP_TAILSCALE_HOST").map(String::as_str),
+            Some("100.x.y.z")
+        );
+        assert_eq!(parsed.get("RTSP_PORT").map(String::as_str), Some("554"));
+        assert_eq!(
+            parsed.get("RTSP_PASSWORD").map(String::as_str),
+            Some("p@ss#word_with_hash")
+        );
+        assert_eq!(parsed.get("NUM_CAMERAS").map(String::as_str), Some("12"));
+        assert_eq!(
+            parsed.get("IP_CAMERA_START_CHANNEL").map(String::as_str),
+            Some("10")
+        );
+        assert_eq!(parsed.get("DEFAULT_SUBTYPE").map(String::as_str), Some("1"));
+        assert_eq!(parsed.get("HWACCEL_MODE").map(String::as_str), Some("auto"));
+    }
+
+    #[test]
+    fn test_cwd_env_hijack_prevention_and_atomic_private_write() {
+        let base = std::env::temp_dir().join(format!(
+            "rtsp_viewer_cfg_test_{}_{:08x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ));
+        let unrelated_cwd = base.join("some_webapp");
+        let rtsp_cwd = base.join("nvr_checkout");
+        let home_rtsp_dir = base.join(".rtsp_viewer");
+        let user_env = home_rtsp_dir.join(".env");
+
+        fs::create_dir_all(&unrelated_cwd).unwrap();
+        fs::create_dir_all(&rtsp_cwd).unwrap();
+
+        // 1. Unrelated project's .env MUST NOT be hijacked or returned
+        let unrelated_env = unrelated_cwd.join(".env");
+        fs::write(&unrelated_env, "DATABASE_URL=postgres://localhost/db\nSECRET_KEY=xyz\n").unwrap();
+        let resolved = locate_env_file_from(None, None, user_env.clone(), Some(&unrelated_cwd), None);
+        assert_eq!(resolved, user_env);
+
+        // 2. Legitimate repo .env with RTSP_ key is used only when ~/.rtsp_viewer/.env doesn't exist yet
+        let repo_env = rtsp_cwd.join(".env");
+        fs::write(&repo_env, "RTSP_HOST=\"192.168.1.200\"\n").unwrap();
+        let resolved_repo = locate_env_file_from(None, None, user_env.clone(), Some(&rtsp_cwd), None);
+        assert_eq!(resolved_repo, repo_env);
+
+        // 3. Once ~/.rtsp_viewer/.env exists, it takes priority over CWD .env
+        write_private_file(&user_env, "RTSP_HOST=\"10.0.0.5\"\n").unwrap();
+        let dir_mode = fs::metadata(&home_rtsp_dir).unwrap().permissions().mode() & 0o777;
+        let file_mode = fs::metadata(&user_env).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+
+        let resolved_user = locate_env_file_from(None, None, user_env.clone(), Some(&rtsp_cwd), None);
+        assert_eq!(resolved_user, user_env);
+
+        // 4. SNAP_USER_COMMON and RTSP_ENV_FILE take top priority
+        let snap_dir = base.join("snap_common");
+        let resolved_snap = locate_env_file_from(
+            None,
+            Some(snap_dir.to_str().unwrap()),
+            user_env.clone(),
+            Some(&rtsp_cwd),
+            None,
+        );
+        assert_eq!(resolved_snap, snap_dir.join(".env"));
+
+        let explicit_file = base.join("custom.env");
+        let resolved_explicit = locate_env_file_from(
+            Some(explicit_file.to_str().unwrap()),
+            Some(snap_dir.to_str().unwrap()),
+            user_env,
+            Some(&rtsp_cwd),
+            None,
+        );
+        assert_eq!(resolved_explicit, explicit_file);
+
+        // Verify unrelated .env was completely untouched
+        assert_eq!(
+            fs::read_to_string(&unrelated_env).unwrap(),
+            "DATABASE_URL=postgres://localhost/db\nSECRET_KEY=xyz\n"
+        );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn test_dahua_p2p_hikvision_and_ipv6_url_generation() {
         let mut cfg = NvrEnvConfig {
             brand: "dahua".to_string(),
             host: "192.168.1.50".to_string(),
@@ -565,12 +781,28 @@ mod tests {
             cfg.build_rtsp_url(3, 1),
             "rtsp://admin:my%40pass@100.64.0.10:554/Streaming/Channels/302"
         );
+
+        // Raw IPv6 literal bracketing (and idempotence when already bracketed)
+        cfg.use_tailscale = false;
+        cfg.brand = "dahua".to_string();
+        cfg.host = "2001:db8::108".to_string();
+        assert_eq!(
+            cfg.build_rtsp_url(1, 1),
+            "rtsp://admin:my%40pass@[2001:db8::108]:554/cam/realmonitor?channel=1&subtype=1"
+        );
+        cfg.host = "[2001:db8::108]".to_string();
+        assert_eq!(
+            cfg.build_rtsp_url(1, 1),
+            "rtsp://admin:my%40pass@[2001:db8::108]:554/cam/realmonitor?channel=1&subtype=1"
+        );
     }
 
     #[test]
     fn test_dynamic_channel_normalization_and_swapping() {
-        let mut app_cfg = AppConfig::default();
-        app_cfg.num_cameras = 12;
+        let mut app_cfg = AppConfig {
+            num_cameras: 12,
+            ..Default::default()
+        };
         app_cfg.normalize_channels();
         assert_eq!(app_cfg.channel_order.len(), 12);
         assert_eq!(app_cfg.channel_order[11], 12);

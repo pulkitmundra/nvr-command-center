@@ -2,9 +2,9 @@ use crate::config::NvrEnvConfig;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::io::AsRawFd;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -21,6 +21,7 @@ pub enum StreamStatus {
     Reconnecting = 2,
     Paused = 3,
     Error = 4,
+    AuthError = 5,
 }
 
 impl StreamStatus {
@@ -30,6 +31,7 @@ impl StreamStatus {
             1 => Self::Live,
             2 => Self::Reconnecting,
             3 => Self::Paused,
+            5 => Self::AuthError,
             _ => Self::Error,
         }
     }
@@ -41,6 +43,7 @@ impl StreamStatus {
             Self::Reconnecting => "Reconnecting",
             Self::Paused => "Paused",
             Self::Error => "Offline",
+            Self::AuthError => "Auth Failed (401)",
         }
     }
 }
@@ -59,11 +62,13 @@ pub struct FrameSlot {
     pub status: AtomicU8,
     pub target_subtype: AtomicU8,
     pub active_subtype: AtomicU8,
+    pub auto_promoted_hd: AtomicBool,
     pub paused: AtomicBool,
     pub background_eco: AtomicBool,
     pub force_resync: AtomicBool,
     pub stop_flag: AtomicBool,
-    pub active_child_pid: AtomicU32,
+    pub active_child: Mutex<Option<Child>>,
+    pub wake_pair: (Mutex<bool>, Condvar),
     pub last_frame_epoch_ms: AtomicU64,
     pub connect_start_epoch_ms: AtomicU64,
     pub fps_x10: AtomicU32,
@@ -86,11 +91,13 @@ impl FrameSlot {
             status: AtomicU8::new(StreamStatus::Connecting as u8),
             target_subtype: AtomicU8::new(default_subtype),
             active_subtype: AtomicU8::new(default_subtype),
+            auto_promoted_hd: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             background_eco: AtomicBool::new(false),
             force_resync: AtomicBool::new(false),
             stop_flag: AtomicBool::new(false),
-            active_child_pid: AtomicU32::new(0),
+            active_child: Mutex::new(None),
+            wake_pair: (Mutex::new(false), Condvar::new()),
             last_frame_epoch_ms: AtomicU64::new(0),
             connect_start_epoch_ms: AtomicU64::new(now_epoch_ms()),
             fps_x10: AtomicU32::new(0),
@@ -107,18 +114,57 @@ impl FrameSlot {
         self.status.store(st as u8, Ordering::Release);
     }
 
+    pub fn notify_wake(&self) {
+        let (lock, cvar) = &self.wake_pair;
+        if let Ok(mut woken) = lock.lock() {
+            *woken = true;
+            cvar.notify_all();
+        }
+    }
+
+    pub fn sleep_interruptible(&self, dur: Duration) {
+        if dur.is_zero() || self.stop_flag.load(Ordering::Acquire) {
+            return;
+        }
+        let (lock, cvar) = &self.wake_pair;
+        let Ok(mut woken) = lock.lock() else {
+            return;
+        };
+        if self.stop_flag.load(Ordering::Acquire) {
+            return;
+        }
+        if *woken {
+            *woken = false;
+            return;
+        }
+        if let Ok((mut guard, _)) = cvar.wait_timeout_while(woken, dur, |w| {
+            !*w && !self.stop_flag.load(Ordering::Acquire)
+        }) {
+            if !self.stop_flag.load(Ordering::Acquire) {
+                *guard = false;
+            }
+        }
+    }
+
     pub fn request_subtype(&self, subtype: u8) {
         let clamped = if subtype == 0 { 0 } else { 1 };
         let prev = self.target_subtype.swap(clamped, Ordering::AcqRel);
         if prev != clamped {
             self.force_resync.store(true, Ordering::Release);
             self.kill_active_child();
+            self.notify_wake();
         }
+    }
+
+    pub fn set_manual_subtype(&self, subtype: u8) {
+        self.auto_promoted_hd.store(false, Ordering::Release);
+        self.request_subtype(subtype);
     }
 
     pub fn trigger_resync(&self) {
         self.force_resync.store(true, Ordering::Release);
         self.kill_active_child();
+        self.notify_wake();
     }
 
     pub fn set_paused(&self, pause: bool) {
@@ -127,17 +173,25 @@ impl FrameSlot {
             self.set_status(StreamStatus::Paused);
             self.fps_x10.store(0, Ordering::Release);
             self.kill_active_child();
+            self.notify_wake();
         } else if !pause && was_paused {
             self.set_status(StreamStatus::Connecting);
             self.force_resync.store(true, Ordering::Release);
+            self.notify_wake();
         }
     }
 
+    pub fn has_active_child(&self) -> bool {
+        self.active_child
+            .lock()
+            .map(|guard| guard.is_some())
+            .unwrap_or(false)
+    }
+
     pub fn kill_active_child(&self) {
-        let pid = self.active_child_pid.swap(0, Ordering::AcqRel);
-        if pid > 0 {
-            unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+        if let Ok(mut guard) = self.active_child.lock() {
+            if let Some(ref mut child) = *guard {
+                let _ = child.kill();
             }
         }
     }
@@ -168,12 +222,51 @@ fn pipe_available_bytes(fd: i32) -> usize {
     }
 }
 
+fn configure_child_lifecycle(cmd: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let parent_pid = unsafe { libc::getpid() };
+        unsafe {
+            cmd.pre_exec(move || {
+                let _ = libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+                if libc::getppid() != parent_pid {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+fn is_rtsp_auth_error(stderr_text: &str) -> bool {
+    let lower = stderr_text.to_ascii_lowercase();
+    lower.contains("401 unauthorized")
+        || lower.contains("403 forbidden")
+        || lower.contains("authorization failed")
+}
+
+fn sleep_watchdog_stop(stop_pair: &(Mutex<bool>, Condvar), dur: Duration) -> bool {
+    let (lock, cvar) = stop_pair;
+    let Ok(stopped) = lock.lock() else {
+        return true;
+    };
+    if *stopped {
+        return true;
+    }
+    match cvar.wait_timeout_while(stopped, dur, |s| !*s) {
+        Ok((guard, _)) => *guard,
+        Err(_) => true,
+    }
+}
+
 pub struct StreamManager {
     env_cfg: Arc<RwLock<NvrEnvConfig>>,
     p2p_ready: Arc<AtomicBool>,
+    auth_lockout_guard: Arc<AtomicBool>,
     slots: BTreeMap<usize, Arc<FrameSlot>>,
     workers: Vec<JoinHandle<()>>,
-    watchdog_stop: Arc<AtomicBool>,
+    watchdog_stop: Arc<(Mutex<bool>, Condvar)>,
     watchdog_handle: Option<JoinHandle<()>>,
 }
 
@@ -183,16 +276,20 @@ impl StreamManager {
         Self {
             env_cfg: shared_env,
             p2p_ready,
+            auth_lockout_guard: Arc::new(AtomicBool::new(false)),
             slots: BTreeMap::new(),
             workers: Vec::new(),
-            watchdog_stop: Arc::new(AtomicBool::new(false)),
+            watchdog_stop: Arc::new((Mutex::new(false), Condvar::new())),
             watchdog_handle: None,
         }
     }
 
     pub fn start_streams(&mut self, num_cameras: usize) {
         self.stop_all();
-        self.watchdog_stop.store(false, Ordering::Release);
+        if let Ok(mut stopped) = self.watchdog_stop.0.lock() {
+            *stopped = false;
+        }
+        self.auth_lockout_guard.store(false, Ordering::Release);
 
         let env_snapshot = self.env_cfg.read().unwrap().clone();
         let default_sub = env_snapshot.default_subtype;
@@ -218,9 +315,10 @@ impl StreamManager {
             if let Some(slot) = self.slots.get(&ch).cloned() {
                 let env_ref = Arc::clone(&self.env_cfg);
                 let p2p_ready_ref = Arc::clone(&self.p2p_ready);
+                let auth_guard_ref = Arc::clone(&self.auth_lockout_guard);
                 let handle = thread::Builder::new()
                     .name(format!("rtsp-cam-{}", ch))
-                    .spawn(move || camera_worker_loop(slot, env_ref, p2p_ready_ref))
+                    .spawn(move || camera_worker_loop(slot, env_ref, p2p_ready_ref, auth_guard_ref))
                     .expect("Failed to spawn camera worker thread");
                 self.workers.push(handle);
             }
@@ -253,6 +351,7 @@ impl StreamManager {
     }
 
     pub fn resync_all(&self) {
+        self.auth_lockout_guard.store(false, Ordering::Release);
         for slot in self.slots.values() {
             slot.trigger_resync();
         }
@@ -266,26 +365,30 @@ impl StreamManager {
 
     pub fn set_all_subtype(&self, subtype: u8) {
         for slot in self.slots.values() {
-            slot.request_subtype(subtype);
+            slot.set_manual_subtype(subtype);
         }
     }
 
-    pub fn set_fullscreen_focus(&self, focused_channel: Option<usize>, auto_hd: bool, default_sub: u8) {
+    pub fn set_fullscreen_focus(&self, focused_channel: Option<usize>, auto_hd: bool) {
         for (&ch, slot) in &self.slots {
             match focused_channel {
                 Some(target_ch) if ch == target_ch => {
                     slot.background_eco.store(false, Ordering::Release);
-                    if auto_hd {
+                    if auto_hd && slot.target_subtype.load(Ordering::Acquire) != 0 {
+                        slot.auto_promoted_hd.store(true, Ordering::Release);
                         slot.request_subtype(0);
                     }
                 }
                 Some(_) => {
                     // Background camera while another camera is fullscreen
                     slot.background_eco.store(true, Ordering::Release);
+                    if slot.auto_promoted_hd.swap(false, Ordering::AcqRel) {
+                        slot.request_subtype(1);
+                    }
                 }
                 None => {
                     slot.background_eco.store(false, Ordering::Release);
-                    if auto_hd && slot.target_subtype.load(Ordering::Acquire) == 0 && default_sub == 1 {
+                    if slot.auto_promoted_hd.swap(false, Ordering::AcqRel) {
                         slot.request_subtype(1);
                     }
                 }
@@ -300,10 +403,14 @@ impl StreamManager {
     }
 
     pub fn stop_all(&mut self) {
-        self.watchdog_stop.store(true, Ordering::Release);
+        if let Ok(mut stopped) = self.watchdog_stop.0.lock() {
+            *stopped = true;
+            self.watchdog_stop.1.notify_all();
+        }
         for slot in self.slots.values() {
             slot.stop_flag.store(true, Ordering::Release);
             slot.kill_active_child();
+            slot.notify_wake();
         }
         if let Some(h) = self.watchdog_handle.take() {
             let _ = h.join();
@@ -323,15 +430,11 @@ impl Drop for StreamManager {
 
 fn watchdog_loop(
     slots: Vec<Arc<FrameSlot>>,
-    stop_flag: Arc<AtomicBool>,
+    stop_pair: Arc<(Mutex<bool>, Condvar)>,
     env_cfg: Arc<RwLock<NvrEnvConfig>>,
     p2p_ready: Arc<AtomicBool>,
 ) {
-    while !stop_flag.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(500));
-        if stop_flag.load(Ordering::Acquire) {
-            break;
-        }
+    while !sleep_watchdog_stop(&stop_pair, Duration::from_millis(500)) {
         let is_cloud = env_cfg
             .read()
             .map(|c| c.use_cloud_p2p && !c.p2p_serial.trim().is_empty())
@@ -347,20 +450,22 @@ fn watchdog_loop(
             if slot.paused.load(Ordering::Acquire) || slot.stop_flag.load(Ordering::Acquire) {
                 continue;
             }
-            let pid = slot.active_child_pid.load(Ordering::Acquire);
-            if pid == 0 {
+            if !slot.has_active_child() {
                 continue;
             }
             let st = slot.status();
             let last_frame = slot.last_frame_epoch_ms.load(Ordering::Acquire);
             let conn_start = slot.connect_start_epoch_ms.load(Ordering::Acquire);
 
-            if st == StreamStatus::Live && last_frame > 0 && now.saturating_sub(last_frame) > live_stall_ms {
-                slot.kill_active_child();
-            } else if (st == StreamStatus::Connecting || st == StreamStatus::Reconnecting)
+            let live_stalled = st == StreamStatus::Live
+                && last_frame > 0
+                && now.saturating_sub(last_frame) > live_stall_ms;
+            let connect_stalled = (st == StreamStatus::Connecting
+                || st == StreamStatus::Reconnecting)
                 && conn_start > 0
-                && now.saturating_sub(conn_start) > connect_timeout_ms
-            {
+                && now.saturating_sub(conn_start) > connect_timeout_ms;
+
+            if live_stalled || connect_stalled {
                 slot.kill_active_child();
             }
         }
@@ -371,15 +476,31 @@ fn camera_worker_loop(
     slot: Arc<FrameSlot>,
     env_cfg: Arc<RwLock<NvrEnvConfig>>,
     p2p_ready: Arc<AtomicBool>,
+    auth_lockout_guard: Arc<AtomicBool>,
 ) {
     let mut back_buf: Vec<u8> = Vec::new();
+    let mut stderr_scratch = [0u8; 2048];
     let mut consecutive_failures: u32 = 0;
 
     while !slot.stop_flag.load(Ordering::Acquire) {
         if slot.paused.load(Ordering::Acquire) {
             slot.set_status(StreamStatus::Paused);
-            thread::sleep(Duration::from_millis(120));
+            slot.sleep_interruptible(Duration::from_millis(120));
             continue;
+        }
+
+        if auth_lockout_guard.load(Ordering::Acquire) && !slot.force_resync.load(Ordering::Acquire) {
+            slot.set_status(StreamStatus::AuthError);
+            slot.sleep_interruptible(Duration::from_secs(30));
+            if slot.stop_flag.load(Ordering::Acquire) {
+                break;
+            }
+            // Allow channel 1 (or manual resync) to gently probe once every 30s without a 12-cam storm
+            if slot.channel == 1 {
+                auth_lockout_guard.store(false, Ordering::Release);
+            } else {
+                continue;
+            }
         }
 
         // Clear force_resync BEFORE reading target_subtype so any concurrent request_subtype
@@ -400,7 +521,7 @@ fn camera_worker_loop(
                 } else {
                     slot.set_status(StreamStatus::Reconnecting);
                 }
-                thread::sleep(Duration::from_millis(120));
+                slot.sleep_interruptible(Duration::from_millis(120));
                 continue;
             }
             if slot.frame_seq.load(Ordering::Acquire) == 0 && consecutive_failures == 0 {
@@ -412,7 +533,10 @@ fn camera_worker_loop(
                     90 + (slot.channel.saturating_sub(1) as u64) * 25
                 };
                 if stagger_ms > 0 {
-                    thread::sleep(Duration::from_millis(stagger_ms));
+                    slot.sleep_interruptible(Duration::from_millis(stagger_ms));
+                    if slot.stop_flag.load(Ordering::Acquire) {
+                        break;
+                    }
                 }
             }
         }
@@ -436,11 +560,14 @@ fn camera_worker_loop(
         };
 
         let mut cmd = Command::new("ffmpeg");
+        configure_child_lifecycle(&mut cmd);
         cmd.arg("-nostdin")
             .arg("-v")
             .arg("error")
             .arg("-rtsp_transport")
             .arg("tcp")
+            .arg("-timeout")
+            .arg("5000000")
             .arg("-fflags")
             .arg("nobuffer+discardcorrupt")
             .arg("-flags")
@@ -476,18 +603,29 @@ fn camera_worker_loop(
             .arg("-")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(_) => {
                 slot.set_status(StreamStatus::Error);
-                thread::sleep(Duration::from_secs(2));
+                slot.sleep_interruptible(Duration::from_secs(2));
                 continue;
             }
         };
 
-        slot.active_child_pid.store(child.id(), Ordering::Release);
+        let Some(mut stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            continue;
+        };
+        let mut stderr = child.stderr.take();
+
+        {
+            if let Ok(mut guard) = slot.active_child.lock() {
+                *guard = Some(child);
+            }
+        }
 
         // If a resync, pause, stop, or subtype change arrived while cmd.spawn() was executing,
         // abort this child immediately
@@ -496,40 +634,42 @@ fn camera_worker_loop(
             || slot.force_resync.load(Ordering::Acquire)
             || slot.target_subtype.load(Ordering::Acquire) != subtype
         {
-            slot.active_child_pid.store(0, Ordering::Release);
-            let _ = child.kill();
-            let _ = child.wait();
+            let taken = slot.active_child.lock().ok().and_then(|mut g| g.take());
+            if let Some(mut c) = taken {
+                let _ = c.kill();
+                let _ = c.wait();
+            }
             continue;
         }
 
-        let mut stdout = match child.stdout.take() {
-            Some(out) => out,
-            None => {
-                slot.active_child_pid.store(0, Ordering::Release);
-                let _ = child.kill();
-                let _ = child.wait();
-                continue;
-            }
-        };
-
         let pipe_fd = stdout.as_raw_fd();
+        #[cfg(target_os = "linux")]
+        unsafe {
+            // Raise Linux anonymous pipe capacity from 64 KiB default to 1 MiB (~2 full SD RGBA frames)
+            // so ioctl(FIONREAD) >= frame_bytes genuinely activates zero-lag burst frame draining.
+            if libc::fcntl(pipe_fd, libc::F_SETPIPE_SZ, 1_048_576) < 0 {
+                let _ = libc::fcntl(pipe_fd, libc::F_SETPIPE_SZ, 524_288);
+            }
+        }
+
         let mut fps_window_start = Instant::now();
         let mut fps_frames: u32 = 0;
         let mut eco_frame_counter: u64 = 0;
         let mut received_any_frame = false;
 
-        loop {
+        'frame_loop: loop {
             if slot.stop_flag.load(Ordering::Acquire)
                 || slot.paused.load(Ordering::Acquire)
                 || slot.force_resync.load(Ordering::Acquire)
             {
-                break;
+                break 'frame_loop;
             }
 
             match stdout.read_exact(&mut back_buf) {
                 Ok(()) => {
                     received_any_frame = true;
                     consecutive_failures = 0;
+                    auth_lockout_guard.store(false, Ordering::Release);
 
                     // Zero-Lag Kernel Pipe Burst Drain:
                     // If 1 or more newer frames are already waiting in the OS pipe buffer,
@@ -538,7 +678,8 @@ fn camera_worker_loop(
                     let mut drained = 0u64;
                     while pipe_available_bytes(pipe_fd) >= frame_bytes && drained < 16 {
                         if stdout.read_exact(&mut back_buf).is_err() {
-                            break;
+                            // Do NOT publish a partially overwritten/torn frame
+                            break 'frame_loop;
                         }
                         drained += 1;
                     }
@@ -560,12 +701,22 @@ fn camera_worker_loop(
                         slot.fps_x10.store(fps10, Ordering::Release);
                         fps_frames = 0;
                         fps_window_start = Instant::now();
+
+                        // Drain any sporadic decoder warning bytes from stderr so the 64 KiB pipe never blocks over 24/7 uptime
+                        if let Some(ref mut err_pipe) = stderr {
+                            let err_fd = err_pipe.as_raw_fd();
+                            let avail = pipe_available_bytes(err_fd);
+                            if avail > 0 {
+                                let to_read = avail.min(stderr_scratch.len());
+                                let _ = err_pipe.read(&mut stderr_scratch[..to_read]);
+                            }
+                        }
                     }
 
                     // In background eco mode (e.g. minimized or another camera is Fullscreen),
                     // only publish 1 frame every 4 frames while still draining the socket at 100% wire speed!
                     let should_publish = if slot.background_eco.load(Ordering::Acquire) {
-                        eco_frame_counter % 4 == 0
+                        eco_frame_counter.is_multiple_of(4)
                     } else {
                         true
                     };
@@ -584,14 +735,16 @@ fn camera_worker_loop(
                     }
                 }
                 Err(_) => {
-                    break;
+                    break 'frame_loop;
                 }
             }
         }
 
-        slot.active_child_pid.store(0, Ordering::Release);
-        let _ = child.kill();
-        let _ = child.wait();
+        let exited_child = slot.active_child.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut c) = exited_child {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
 
         if slot.stop_flag.load(Ordering::Acquire) {
             break;
@@ -605,25 +758,51 @@ fn camera_worker_loop(
             continue;
         }
 
+        let mut auth_rejected = false;
         if !received_any_frame {
             consecutive_failures = consecutive_failures.saturating_add(1);
+            if let Some(err_pipe) = stderr.take() {
+                let mut err_bytes = Vec::with_capacity(512);
+                let _ = err_pipe.take(2048).read_to_end(&mut err_bytes);
+                if !err_bytes.is_empty() {
+                    let err_text = String::from_utf8_lossy(&err_bytes);
+                    if is_rtsp_auth_error(&err_text) {
+                        auth_rejected = true;
+                    }
+                }
+            }
         }
+
         slot.reconnect_count.fetch_add(1, Ordering::Relaxed);
         slot.fps_x10.store(0, Ordering::Release);
 
-        if consecutive_failures >= 3 {
-            slot.set_status(StreamStatus::Error);
+        let backoff_ms = if auth_rejected {
+            auth_lockout_guard.store(true, Ordering::Release);
+            slot.set_status(StreamStatus::AuthError);
+            match consecutive_failures {
+                0 | 1 => 10_000,
+                2 => 20_000,
+                _ => 30_000,
+            }
         } else {
-            slot.set_status(StreamStatus::Reconnecting);
-        }
-
-        let backoff_ms = match consecutive_failures {
-            0 | 1 => 300,
-            2 => 800,
-            3 => 1500,
-            _ => 2500,
+            if consecutive_failures >= 3 {
+                slot.set_status(StreamStatus::Error);
+            } else {
+                slot.set_status(StreamStatus::Reconnecting);
+            }
+            match consecutive_failures {
+                0 | 1 => 300,
+                2 => 800,
+                3 => 1_500,
+                4 => 3_000,
+                5 => 6_000,
+                6 => 12_000,
+                7 => 20_000,
+                _ => 30_000,
+            }
         };
-        thread::sleep(Duration::from_millis(backoff_ms));
+
+        slot.sleep_interruptible(Duration::from_millis(backoff_ms));
     }
 }
 
@@ -635,13 +814,17 @@ pub fn scan_active_nvr_channels(env_cfg: &NvrEnvConfig, max_channels: usize) -> 
     for ch in 1..=max_ch {
         let url = env_cfg.build_rtsp_url(ch, 1);
         handles.push(thread::spawn(move || {
-            let output = Command::new("timeout")
+            let mut cmd = Command::new("timeout");
+            configure_child_lifecycle(&mut cmd);
+            let output = cmd
                 .arg("3")
                 .arg("ffprobe")
                 .arg("-v")
                 .arg("error")
                 .arg("-rtsp_transport")
                 .arg("tcp")
+                .arg("-timeout")
+                .arg("2500000")
                 .arg("-probesize")
                 .arg("32768")
                 .arg("-analyzeduration")
@@ -654,6 +837,7 @@ pub fn scan_active_nvr_channels(env_cfg: &NvrEnvConfig, max_channels: usize) -> 
                 .arg("stream=codec_name")
                 .arg("-of")
                 .arg("default=noprint_wrappers=1:nokey=1")
+                .arg("-i")
                 .arg(&url)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
@@ -682,4 +866,79 @@ pub fn scan_active_nvr_channels(env_cfg: &NvrEnvConfig, max_channels: usize) -> 
     }
     active.sort_unstable();
     active
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patrol_auto_hd_downgrades_only_auto_promoted_slots() {
+        let env_cfg = NvrEnvConfig::default();
+        let p2p_ready = Arc::new(AtomicBool::new(false));
+        let mut mgr = StreamManager::new(env_cfg, p2p_ready);
+        for ch in 1..=4 {
+            mgr.slots.insert(ch, FrameSlot::new(ch, 1));
+        }
+
+        // User manually promotes Camera 3 to HD in Grid View
+        mgr.slot(3).unwrap().set_manual_subtype(0);
+        assert_eq!(mgr.slot(3).unwrap().target_subtype.load(Ordering::Acquire), 0);
+        assert!(!mgr.slot(3).unwrap().auto_promoted_hd.load(Ordering::Acquire));
+
+        // Patrol focuses Camera 1 with auto_hd = true -> Camera 1 promoted, Camera 3 stays HD
+        mgr.set_fullscreen_focus(Some(1), true);
+        assert_eq!(mgr.slot(1).unwrap().target_subtype.load(Ordering::Acquire), 0);
+        assert!(mgr.slot(1).unwrap().auto_promoted_hd.load(Ordering::Acquire));
+        assert_eq!(mgr.slot(3).unwrap().target_subtype.load(Ordering::Acquire), 0);
+
+        // Patrol rotates to Camera 2 -> Camera 1 MUST downgrade back to SD (1), Camera 2 promotes to HD (0), Camera 3 stays HD (0)
+        mgr.set_fullscreen_focus(Some(2), true);
+        assert_eq!(mgr.slot(1).unwrap().target_subtype.load(Ordering::Acquire), 1);
+        assert!(!mgr.slot(1).unwrap().auto_promoted_hd.load(Ordering::Acquire));
+        assert_eq!(mgr.slot(2).unwrap().target_subtype.load(Ordering::Acquire), 0);
+        assert_eq!(mgr.slot(3).unwrap().target_subtype.load(Ordering::Acquire), 0);
+
+        // Patrol rotates to Camera 3 (already user-selected HD) -> Camera 2 downgrades to SD, Camera 3 stays non-auto HD
+        mgr.set_fullscreen_focus(Some(3), true);
+        assert_eq!(mgr.slot(2).unwrap().target_subtype.load(Ordering::Acquire), 1);
+        assert_eq!(mgr.slot(3).unwrap().target_subtype.load(Ordering::Acquire), 0);
+        assert!(!mgr.slot(3).unwrap().auto_promoted_hd.load(Ordering::Acquire));
+
+        // Exit Fullscreen -> Camera 3 remains user-selected HD (0), all others are SD (1)
+        mgr.set_fullscreen_focus(None, true);
+        assert_eq!(mgr.slot(1).unwrap().target_subtype.load(Ordering::Acquire), 1);
+        assert_eq!(mgr.slot(2).unwrap().target_subtype.load(Ordering::Acquire), 1);
+        assert_eq!(mgr.slot(3).unwrap().target_subtype.load(Ordering::Acquire), 0);
+        assert_eq!(mgr.slot(4).unwrap().target_subtype.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn test_condvar_sleep_interruptible_wakes_immediately() {
+        let slot = FrameSlot::new(1, 1);
+        let slot_bg = Arc::clone(&slot);
+        let start = Instant::now();
+
+        let handle = thread::spawn(move || {
+            slot_bg.sleep_interruptible(Duration::from_secs(30));
+        });
+
+        thread::sleep(Duration::from_millis(10));
+        slot.stop_flag.store(true, Ordering::Release);
+        slot.notify_wake();
+        handle.join().unwrap();
+
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn test_rtsp_auth_error_detection() {
+        assert!(is_rtsp_auth_error(
+            "[rtsp @ 0x55] method DESCRIBE failed: 401 Unauthorized\n"
+        ));
+        assert!(is_rtsp_auth_error(
+            "Server returned 403 Forbidden (access denied)"
+        ));
+        assert!(!is_rtsp_auth_error("Connection refused"));
+    }
 }
