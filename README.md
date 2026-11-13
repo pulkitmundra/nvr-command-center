@@ -2,6 +2,9 @@
 
 [![Version](https://img.shields.io/badge/version-2.1.1-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
 [![Snap Store](https://img.shields.io/badge/Snap_Store-nvr--command--center-82BEA0?logo=snapcraft&logoColor=white)](https://snapcraft.io/nvr-command-center)
+[![Case Study](https://img.shields.io/badge/Case_Study-Interactive_Demo-10B981?logo=vercel&logoColor=white)](https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center)
+[![Architecture Deep Dive](https://img.shields.io/badge/Deep_Dive-64KB_Linux_Pipe_Trap-0EA5E9?logo=linux&logoColor=white)](https://pulkit-mundra-portfolio.vercel.app/engineering/python-to-rust-12-camera-nvr-linux-pipe-trap)
+[![Portfolio](https://img.shields.io/badge/Portfolio-pulkit--mundra-2563EB?logo=vercel&logoColor=white)](https://pulkit-mundra-portfolio.vercel.app)
 [![Rust](https://img.shields.io/badge/Rust-Native_GPU-orange?logo=rust)](https://www.rust-lang.org/)
 [![Platform](https://img.shields.io/badge/Platform-Linux%20%7C%20Ubuntu-E95420?logo=ubuntu&logoColor=white)](https://github.com/pulkitmundra/nvr-command-center)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -11,6 +14,8 @@
 An ultra-low-latency, GPU-accelerated multi-camera NVR/DVR surveillance command center built in **Native Rust (`eframe` / `egui` + OpenGL `glow`)** with parallel zero-probe FFmpeg workers, kernel pipe burst draining, and built-in **Cloud P2P remote tunneling**.
 
 Designed to stream **12+ concurrent cameras (`1 - 32` channels)** 24/7 with **`< 0.9s` parallel startup**, **`< 80ms` glass-to-glass latency**, **zero stream drift**, and **`~65 - 110 MB` total RAM** - on both local LAN and any remote internet connection.
+
+> **Interactive Simulator & Systems Writeup:** Try the live browser-based 12-camera pipe-drain simulator in the [**Case Study**](https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center) or read the engineering postmortem: [**650 MB to 70 MB RAM: Porting a 12-Camera Python CCTV Wall & Solving the 64 KB Linux Pipe Trap ->**](https://pulkit-mundra-portfolio.vercel.app/engineering/python-to-rust-12-camera-nvr-linux-pipe-trap)
 
 ---
 
@@ -147,15 +152,16 @@ Set `HWACCEL_MODE="auto"` (default) in the in-app **Settings** modal or `.env`. 
 
 | Project | Description | Links |
 | :--- | :--- | :--- |
-| **[Crunchyroll Ubuntu Desktop](https://github.com/pulkitmundra/crunchyroll-ubuntu-desktop)** | Unofficial Linux Desktop & HTPC client for Crunchyroll with Widevine DRM, Custom Lists, Auto-Skip HUD, In-Player Quality Selector, Sleep Timer & Auto-PiP Mini-Player | [GitHub](https://github.com/pulkitmundra/crunchyroll-ubuntu-desktop) · [Snap Store](https://snapcraft.io/crunchyroll-ubuntu-desktop) |
-| **[Galaxy Buds Ubuntu Switcher](https://github.com/pulkitmundra/galaxy-buds-ubuntu)** | Universal Samsung Galaxy Buds (`Buds3 Pro`, `Buds2 Pro`, `Buds FE`, `Buds2`, `Buds Pro`, `Buds Live`, `Buds+`) GNOME 45-48 Quick Settings Switcher, Live Battery %, A2DP/HFP Toggle & Android Call Auto-Handoff | [GitHub](https://github.com/pulkitmundra/galaxy-buds-ubuntu) · [GNOME Extensions](https://extensions.gnome.org/extension/11611/samsung-galaxy-buds-quick-settings-switcher/) |
+| **[Crunchyroll Ubuntu Desktop](https://github.com/pulkitmundra/crunchyroll-ubuntu-desktop)** | Unofficial Linux Desktop & HTPC client for Crunchyroll with Widevine DRM, Custom Lists, Auto-Skip HUD, In-Player Quality Selector, Sleep Timer & Auto-PiP Mini-Player | [GitHub](https://github.com/pulkitmundra/crunchyroll-ubuntu-desktop) · [Snap Store](https://snapcraft.io/crunchyroll-ubuntu-desktop) · [Case Study](https://pulkit-mundra-portfolio.vercel.app/projects/crunchyroll-ubuntu-desktop) · [Wayland Deep Dive](https://pulkit-mundra-portfolio.vercel.app/engineering/wayland-fullscreen-black-curtain-translucent-linux-player) |
+| **[Galaxy Buds Ubuntu Switcher](https://github.com/pulkitmundra/galaxy-buds-ubuntu)** | Universal Samsung Galaxy Buds (`Buds3 Pro`, `Buds2 Pro`, `Buds FE`, `Buds2`, `Buds Pro`, `Buds Live`, `Buds+`) GNOME 45-48 Quick Settings Switcher, Live Battery %, A2DP/HFP Toggle & Android Call Auto-Handoff | [GitHub](https://github.com/pulkitmundra/galaxy-buds-ubuntu) · [GNOME Extensions](https://extensions.gnome.org/extension/11611/samsung-galaxy-buds-quick-settings-switcher/) · [Case Study](https://pulkit-mundra-portfolio.vercel.app/projects/galaxy-buds-ubuntu-switcher) |
 
 ---
 
-## Support the Project
+## Support & Author Links
 
 If **NVR Command Center** helps power your home lab, office security wall, or NVR setup, consider supporting ongoing development:
 
+- **Portfolio & Interactive Lab:** [https://pulkit-mundra-portfolio.vercel.app](https://pulkit-mundra-portfolio.vercel.app) ([Engineering Deep Dives](https://pulkit-mundra-portfolio.vercel.app/engineering))
 - **Buy Me a Coffee:** [https://buymeacoffee.com/pulkitmundra](https://buymeacoffee.com/pulkitmundra)
 - **GitHub Sponsors:** [https://github.com/sponsors/pulkitmundra](https://github.com/sponsors/pulkitmundra)
 
