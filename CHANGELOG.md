@@ -2,6 +2,21 @@
 
 All notable changes to **NVR Command Center** are documented in this file.
 
+## [2.2.0] - 2026-11-15
+
+### Added
+- **Minimal Obsidian Studio UI & Borderless Zen Wall (`src/app.rs`, `src/config.rs`):**
+  - Redesigned the workspace around a `#09090B` Obsidian canvas, `#111114` matte graphite command bar (`38px` 3-zone layout), and progressive-disclosure camera tiles that show only a whisper-quiet status dot + camera name when idle.
+  - Added **Borderless Zen Wall (`B`)** and **OS Monitor Fullscreen (`F11`)** with `2.8s` pointer-idle auto-hide and top-edge (`12px`) hover peek.
+  - Added undistorted **`16:9` Fit vs `Fill`** aspect framing (`A`, persisted via `aspect_fit_16_9` in `config.json`) and an interactive **Keyboard Shortcuts Cheat-Sheet (`?`)** modal.
+- **Smart Area Box Zoom (`e-PTZ` `1.0x - 8.0x`), Native Wayland Pinch & Interactive Radar (`src/app.rs`, `src/wayland_pinch.rs`):**
+  - Added click-drag optical viewfinder **Area Box Zoom (`1.0x - 8.0x`)** with smooth glide animation, `Shift+Drag` / dock `Box` nested box-zoom, `Backspace` zoom-history step-back, smart progressive `Esc` unwind, and zoomed-region cropped PNG snapshots (`C` / right-click menu).
+  - Added a native Linux Wayland `zwp_pointer_gestures_v1` guest listener (`src/wayland_pinch.rs`) for two-finger touchpad pinch-to-zoom plus zero-lag symmetric trackpad scroll zoom (`Event::MouseWheel`), tight pan clamping, and an interactive click/drag bottom-left wireframe radar minimap.
+- **2D Grid Selection & Multi-Tap Chord Engine (`450ms` Window):**
+  - Added active/selected tile borders (`#38BDF8`), 2D grid arrow-key navigation, and single-tap vs triple-tap chords: `S` / `SSS` (`Shift+S`) for SD, `H` / `HHH` (`Shift+H`) for HD, and `Z` / `ZZZ` (`Shift+Z`) for zoom reset.
+- **Portfolio & Architecture Deep-Dive Links (`snap/snapcraft.yaml`, `.github/workflows/snap.yml`, `src/app.rs`, `README.md`):**
+  - Added direct links to the interactive project case study, engineering deep-dive write-up, and developer portfolio in `Settings -> 3. About & Shortcuts`, Snap Store metadata, and documentation.
+
 ## [2.1.1] - 2026-11-11
 
 ### Fixed

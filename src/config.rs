@@ -28,6 +28,7 @@ pub struct AppConfig {
     pub reconnect_interval: u64,
     pub connection_timeout: u64,
     pub fullscreen_auto_hd: bool,
+    pub aspect_fit_16_9: bool,
     pub patrol_interval_secs: u64,
     pub camera_names: BTreeMap<usize, String>,
     pub channel_order: Vec<usize>,
@@ -65,6 +66,7 @@ impl Default for AppConfig {
             reconnect_interval: 3,
             connection_timeout: 5,
             fullscreen_auto_hd: false,
+            aspect_fit_16_9: false,
             patrol_interval_secs: 8,
             camera_names: BTreeMap::new(),
             channel_order: (1..=12).collect(),
@@ -815,5 +817,18 @@ HWACCEL_MODE="auto"            # "auto" (VAAPI/NVDEC with CPU fallback) or "soft
         app_cfg.normalize_channels();
         assert_eq!(app_cfg.channel_order.len(), 16);
         assert_eq!(app_cfg.grid_dimensions(), (4, 4));
+    }
+
+    #[test]
+    fn test_aspect_fit_serde_default_and_roundtrip() {
+        let legacy_json = r#"{"layout_mode":"3x4","num_cameras":12}"#;
+        let parsed: AppConfig = serde_json::from_str(legacy_json).unwrap();
+        assert!(!parsed.aspect_fit_16_9);
+
+        let mut updated = parsed;
+        updated.aspect_fit_16_9 = true;
+        let serialized = serde_json::to_string(&updated).unwrap();
+        let reloaded: AppConfig = serde_json::from_str(&serialized).unwrap();
+        assert!(reloaded.aspect_fit_16_9);
     }
 }

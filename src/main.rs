@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod p2p;
 mod stream;
+mod wayland_pinch;
 
 use app::CameraViewerApp;
 use config::{load_env_config, locate_env_file};

@@ -2156,7 +2156,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rtsp-camera-viewer"
-version = "2.1.1"
+version = "2.2.0"
 dependencies = [
  "aes",
  "base64",
@@ -2171,11 +2171,15 @@ dependencies = [
  "ofb",
  "pbkdf2",
  "rand",
+ "raw-window-handle",
  "serde",
  "serde_json",
  "sha1",
  "sha2",
  "tokio",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "xml-rs",
 ]
 

@@ -174,9 +174,11 @@ jobs:
               view your NVR/DVR/XVR cameras from any outside Wi-Fi or mobile hotspot with
               zero router port forwarding and zero extra home hardware
             * Automatic LAN <-> Cloud P2P & Tailscale detection and 1-click Top Bar switch
-            * Instant < 0.9s parallel multi-camera startup (H.265 / HEVC & H.264)
-            * GPU OpenGL UV shader digital zoom (1.0x - 5.0x) and click-drag pan at 0% CPU
-            * Per-camera [SD]/[HD] stream quality toggle and [Single]/[Grid] view buttons
+            * Minimal Obsidian Studio dark UI with Borderless Zen Wall mode (B / F11),
+              undistorted 16:9 Fit vs Fill framing (A), and progressive-disclosure tile HUD
+            * Smart Area Box Zoom (e-PTZ 1.0x - 8.0x), native Wayland touchpad pinch,
+              and interactive wireframe radar minimap at 0% CPU cost
+            * 2D keyboard grid selection & multi-tap chords (s/sss SD, h/hhh HD, z/zzz zoom)
             * 4.5-second frozen-socket watchdog for 24/7 unattended video wall stability
             * Patrol Mode auto-rotation, 12-camera composite wall PNG snapshots, and
               in-app GUI Settings with first-launch Quick Setup wizard
@@ -189,6 +191,11 @@ jobs:
             easy4ipcloud, cp plus, cpplus, kvms, kvms pro, gcmob, instaon, hikvision,
             ivms, ivms-4200, hik-connect, amcrest, reolink, lorex, imou, tapo, uniview,
             unv, ezviz, p2p, cloud p2p, tailscale, webcam.
+
+            Architecture Deep Dive & More from the Developer (Pulkit Mundra):
+            * Project Case Study & Interactive Architecture Lab: https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center
+            * Engineering Write-Up (650 MB to 70 MB Port & 64 KB Linux Pipe Trap): https://pulkit-mundra-portfolio.vercel.app/engineering/python-to-rust-12-camera-nvr-linux-pipe-trap
+            * Developer Portfolio & More Open-Source Linux Apps: https://pulkit-mundra-portfolio.vercel.app
 
             Support the Project:
             * Buy Me a Coffee: https://buymeacoffee.com/pulkitmundra
@@ -205,7 +212,7 @@ jobs:
             source-code:
               - https://github.com/pulkitmundra/nvr-command-center
             website:
-              - https://github.com/pulkitmundra/nvr-command-center
+              - https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center
           base: core24
           grade: stable
           confinement: strict
