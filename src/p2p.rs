@@ -33,10 +33,146 @@ use zeroize::{Zeroize, Zeroizing};
 type Aes256Ofb = ofb::Ofb<Aes256>;
 type HmacSha256 = Hmac<Sha256>;
 
-// Public DHP2P v5 wire-protocol specification constants (shared across all Dahua/CP Plus/Amcrest clients)
-const MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
-const DHP2P_WSSE_ID: &str = "cba1b29e32cb17aa46b8ff9e73c7f40b";
-const DHP2P_WSSE_SEED: &str = "996103384cdf19179e19243e959bbf8b";
+// Public DHP2P wire-protocol specification constants (shared across all Dahua/CP Plus/Amcrest clients)
+pub const MAIN_SERVER: &str = "www.easy4ipcloud.com:8800";
+pub const DHP2P_WSSE_ID: &str = "cba1b29e32cb17aa46b8ff9e73c7f40b";
+pub const DHP2P_WSSE_SEED: &str = "996103384cdf19179e19243e959bbf8b";
+
+// InstaOn Cloud & Multi-Profile constants
+pub const INSTAON_MAIN_SERVER: &str = "instaonserver.com:8800";
+pub const INSTAON_CTC_SERVER: &str = "instaonserverctc.com:8800";
+pub const DOLYNK_MAIN_SERVER: &str = "p2p.dolynkcloud.com:8800";
+
+// KVMS Pro Lite (InstaOn Windows client)
+pub const KVMS_WSSE_USERNAME: &str = "DuvCSF0EJcNIELdlJsgjXoXhh7m_kplc";
+pub const KVMS_WSSE_USERKEY: &str = "CD3zmkztC63QH3NomRczYTB9lv7KXEuo";
+pub const KVMS_CTC_WSSE_USERNAME: &str = "dS8dT3mS0uF4mX1fO3kA0kR5xB_cpcbc";
+pub const KVMS_CTC_WSSE_USERKEY: &str = "fG6uM4eV9vS2dG3jU5aH7lZ7rU9dO9bK";
+
+// gCMOB (InstaOn Android client)
+pub const GCMOB_WSSE_USERNAME: &str = "89d61b61dc9a69fdcc03e4ff3a3be2f5";
+pub const GCMOB_WSSE_USERKEY: &str = "993c7d7c95542c684c30ff9a9b831249";
+pub const GCMOB_CTC_WSSE_USERNAME: &str = "zH4gW1gQ6eZ1bT1sH9yP6fR2f_cbmbap";
+pub const GCMOB_CTC_WSSE_USERKEY: &str = "dN2cQ9gV2qU0iR3uG0wM8oI9sK0hT9mQ";
+
+// DMSS (Dolynk Android client)
+pub const DMSS_WSSE_USERNAME: &str = "793k5zdi4dd5f037sooag8yo_dolynkc";
+pub const DMSS_WSSE_USERKEY: &str = "ef8hatgmcuk4qamgg4fxx19x33s9q1xy";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct P2PProfile {
+    pub name: &'static str,
+    pub server: &'static str,
+    pub wsse_user: &'static str,
+    pub wsse_key: &'static str,
+    pub verb_get: &'static str,
+    pub verb_post: &'static str,
+    pub to_u_type: Option<&'static str>,
+    pub version: Option<&'static str>,
+    pub sversion: Option<&'static str>,
+    pub app_header_order: bool,
+    pub warmup_path: &'static str,
+}
+
+pub const PROFILE_SMARTPSS: P2PProfile = P2PProfile {
+    name: "smartpss",
+    server: MAIN_SERVER,
+    wsse_user: DHP2P_WSSE_ID,
+    wsse_key: DHP2P_WSSE_SEED,
+    verb_get: "DHGET",
+    verb_post: "DHPOST",
+    to_u_type: None,
+    version: None,
+    sversion: None,
+    app_header_order: false,
+    warmup_path: "/probe/p2psrv",
+};
+
+pub const PROFILE_KVMS: P2PProfile = P2PProfile {
+    name: "kvmsprolite",
+    server: INSTAON_MAIN_SERVER,
+    wsse_user: KVMS_WSSE_USERNAME,
+    wsse_key: KVMS_WSSE_USERKEY,
+    verb_get: "NFGET",
+    verb_post: "NFPOST",
+    to_u_type: Some("Client/KVMSProLite_Win"),
+    version: Some("6.7.15"),
+    sversion: Some("1.1.0"),
+    app_header_order: true,
+    warmup_path: "/online/stun",
+};
+
+pub const PROFILE_GCMOB: P2PProfile = P2PProfile {
+    name: "gcmob",
+    server: INSTAON_MAIN_SERVER,
+    wsse_user: GCMOB_WSSE_USERNAME,
+    wsse_key: GCMOB_WSSE_USERKEY,
+    verb_get: "NFGET",
+    verb_post: "NFPOST",
+    to_u_type: Some("Client/gCMOB_Android"),
+    version: Some("6.7.15"),
+    sversion: Some("1.1.0"),
+    app_header_order: true,
+    warmup_path: "/online/stun",
+};
+
+pub const PROFILE_DMSS: P2PProfile = P2PProfile {
+    name: "dmss",
+    server: DOLYNK_MAIN_SERVER,
+    wsse_user: DMSS_WSSE_USERNAME,
+    wsse_key: DMSS_WSSE_USERKEY,
+    verb_get: "NFGET",
+    verb_post: "NFPOST",
+    to_u_type: Some("Client/Dmss_Android"),
+    version: Some("6.7.15"),
+    sversion: Some("1.1.0"),
+    app_header_order: true,
+    warmup_path: "/online/stun",
+};
+
+pub const PROFILE_KVMS_CTC: P2PProfile = P2PProfile {
+    name: "kvmsprolite-ctc",
+    server: INSTAON_CTC_SERVER,
+    wsse_user: KVMS_CTC_WSSE_USERNAME,
+    wsse_key: KVMS_CTC_WSSE_USERKEY,
+    verb_get: "NFGET",
+    verb_post: "NFPOST",
+    to_u_type: Some("Client/KVMSProLite_Win"),
+    version: Some("6.7.15"),
+    sversion: Some("1.1.0"),
+    app_header_order: true,
+    warmup_path: "/online/stun",
+};
+
+pub const PROFILE_GCMOB_CTC: P2PProfile = P2PProfile {
+    name: "gcmob-ctc",
+    server: INSTAON_CTC_SERVER,
+    wsse_user: GCMOB_CTC_WSSE_USERNAME,
+    wsse_key: GCMOB_CTC_WSSE_USERKEY,
+    verb_get: "NFGET",
+    verb_post: "NFPOST",
+    to_u_type: Some("Client/gCMOB_Android"),
+    version: Some("6.7.15"),
+    sversion: Some("1.1.0"),
+    app_header_order: true,
+    warmup_path: "/online/stun",
+};
+
+pub const DEFAULT_PROFILES: &[P2PProfile] = &[
+    PROFILE_SMARTPSS,
+    PROFILE_KVMS,
+    PROFILE_GCMOB,
+    PROFILE_DMSS,
+    PROFILE_KVMS_CTC,
+    PROFILE_GCMOB_CTC,
+];
+
+pub fn compute_wsse_digest(nonce: &str, created: &str, user: &str, key: &str) -> String {
+    let pwd = format!("{}{}DHP2P:{}:{}", nonce, created, user, key);
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(pwd.as_bytes());
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
 
 const DHP2P_SESSION_IV: &[u8; 16] = b"2z52*lk9o6HRyJrf";
 const DHP2P_INFO_MASK: &[u8; 32] = b"kRjmsUB&ezmdGLL67H#$ojw@XflcaIaf";
@@ -768,7 +904,7 @@ async fn run_tunnel_session(
         .map_err(|e| e.to_string())?;
 
     let handshake_fut = time::timeout(
-        Duration::from_secs(12),
+        Duration::from_secs(20),
         p2p_handshake(
             socket,
             &ctx.serial,
@@ -1220,34 +1356,86 @@ async fn p2p_handshake(
 }
 
 async fn p2p_handshake_inner(
-    socket: UdpSocket,
+    _socket: UdpSocket,
+    serial: &str,
+    username: &str,
+    password: &str,
+) -> Result<(UdpSocket, PTCPSession), String> {
+    let mut last_err = String::new();
+    for profile in DEFAULT_PROFILES {
+        match try_profile_handshake(profile, serial, username, password).await {
+            Ok(res) => return Ok(res),
+            Err(e) => {
+                if is_p2p_auth_rejection(&e) {
+                    return Err(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    Err(format!("All P2P profiles failed (last error: {})", last_err))
+}
+
+async fn try_profile_handshake(
+    profile: &P2PProfile,
     serial: &str,
     username: &str,
     password: &str,
 ) -> Result<(UdpSocket, PTCPSession), String> {
     let serial_safe = validate_p2p_serial(serial)?;
     let mut cseq = 0;
+    let socket = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .map_err(|e| e.to_string())?;
 
-    connect_public_udp(&socket, MAIN_SERVER).await?;
+    // Public-IP SSRF validation applies to every profile's signaling server.
+    connect_public_udp(&socket, profile.server)
+        .await
+        .map_err(|e| format!("{}: connect error: {}", profile.name, e))?;
 
-    dh_request(&socket, "/probe/p2psrv", None, &mut cseq).await?;
-    let _ = dh_read(&socket).await?;
+    if profile.warmup_path == "/online/stun" {
+        dh_request(&socket, "/online/stun", None, &mut cseq, profile, true).await?;
+        let _ = time::timeout(Duration::from_millis(1500), dh_read_raw(&socket)).await;
+    }
+
+    dh_request(&socket, "/probe/p2psrv", None, &mut cseq, profile, false).await?;
+    let _ = time::timeout(Duration::from_millis(1500), dh_read(&socket)).await;
 
     dh_request(
         &socket,
         &format!("/online/p2psrv/{}", serial_safe),
         None,
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
-    let p2psrv = dh_read(&socket)
-        .await?
+
+    let p2psrv_res = time::timeout(Duration::from_millis(2500), dh_read(&socket))
+        .await
+        .map_err(|_| format!("{}: Timeout waiting for /online/p2psrv", profile.name))?
+        .map_err(|e| {
+            // The p2psrv lookup happens BEFORE any NVR credential is sent, so a 401/403 here only
+            // means this cloud does not accept this client profile. Strip the auth markers so the
+            // profile loop continues to the next cloud instead of halting as a bad password.
+            let neutral = e
+                .replace("AUTH_401:", "profile rejected:")
+                .replace("HTTP 401", "HTTP 4xx")
+                .replace("HTTP 403", "HTTP 4xx");
+            format!("{}: /online/p2psrv failed: {}", profile.name, neutral)
+        })?;
+
+    let p2psrv = p2psrv_res
         .body
         .and_then(|b| b.get("body/US").cloned())
-        .ok_or_else(|| "Missing US p2psrv".to_string())?;
+        .ok_or_else(|| format!("{}: Missing US p2psrv", profile.name))?;
 
     // Pin signaling requests to the NVR's authoritative cluster node on port 8800
-    let cluster_host = p2psrv.split(':').next().unwrap_or("www.easy4ipcloud.com");
+    // so Geo-DNS round-robin differences on remote networks never misroute relay-channel
+    let cluster_host = p2psrv
+        .split(':')
+        .next()
+        .unwrap_or_else(|| profile.server.split(':').next().unwrap_or(""));
     let cluster_main = format!("{}:8800", cluster_host);
     connect_public_udp(&socket, &cluster_main).await?;
 
@@ -1261,18 +1449,30 @@ async fn p2p_handshake_inner(
         &format!("/probe/device/{}", serial_safe),
         None,
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
-    let _ = dh_read(&socket_info).await?;
+    let _ = time::timeout(Duration::from_millis(2000), dh_read(&socket_info)).await;
 
     dh_request(
         &socket_info,
         &format!("/info/device/{}", serial_safe),
         None,
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
-    let info_res = dh_read_raw(&socket_info).await?;
+    let info_res = time::timeout(Duration::from_millis(2500), dh_read_raw(&socket_info))
+        .await
+        .map_err(|_| "Timeout waiting for /info/device".to_string())?
+        .unwrap_or(DHResponse {
+            code: 500,
+            status: "Error".to_string(),
+            body: None,
+        });
+
     let randsalt = if info_res.code < 300 {
         info_res
             .body
@@ -1283,9 +1483,10 @@ async fn p2p_handshake_inner(
         String::new()
     };
 
-    dh_request(&socket, "/online/relay", None, &mut cseq).await?;
-    let relay = dh_read(&socket)
-        .await?
+    dh_request(&socket, "/online/relay", None, &mut cseq, profile, false).await?;
+    let relay = time::timeout(Duration::from_millis(2500), dh_read(&socket))
+        .await
+        .map_err(|_| "Timeout waiting for /online/relay".to_string())??
         .body
         .and_then(|b| b.get("body/Address").cloned())
         .ok_or_else(|| "Missing relay address".to_string())?;
@@ -1319,14 +1520,17 @@ async fn p2p_handshake_inner(
         &format!("/device/{}/p2p-channel", serial_safe),
         Some(&channel_body),
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
 
     connect_public_udp(&socket2, &relay).await?;
 
-    dh_request(&socket2, "/relay/agent", None, &mut cseq).await?;
-    let relay_data = dh_read(&socket2)
-        .await?
+    dh_request(&socket2, "/relay/agent", None, &mut cseq, profile, false).await?;
+    let relay_data = time::timeout(Duration::from_millis(2500), dh_read(&socket2))
+        .await
+        .map_err(|_| "Timeout waiting for /relay/agent".to_string())??
         .body
         .ok_or_else(|| "Empty relay agent body".to_string())?;
     let token_raw = relay_data
@@ -1346,16 +1550,22 @@ async fn p2p_handshake_inner(
         &format!("/relay/start/{}", token_safe),
         Some("<body><Client>:0</Client></body>"),
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
-    let _ = dh_read(&socket2).await?;
+    let _ = time::timeout(Duration::from_millis(2500), dh_read(&socket2)).await;
 
-    let mut res = dh_read_raw(&socket).await?;
+    let mut res = time::timeout(Duration::from_millis(3500), dh_read_raw(&socket))
+        .await
+        .map_err(|_| "Timeout waiting for p2p-channel response".to_string())??;
     for _ in 0..4 {
         if res.code >= 200 {
             break;
         }
-        res = dh_read_raw(&socket).await?;
+        res = time::timeout(Duration::from_millis(1500), dh_read_raw(&socket))
+            .await
+            .map_err(|_| "Timeout reading p2p-channel frame".to_string())??;
     }
 
     if res.code == 401 || res.code == 403 {
@@ -1385,6 +1595,8 @@ async fn p2p_handshake_inner(
         &format!("/device/{}/relay-channel", serial_safe),
         Some(&relay_body),
         &mut cseq,
+        profile,
+        false,
     )
     .await?;
 
@@ -1501,26 +1713,43 @@ async fn dh_request(
     path: &str,
     body: Option<&str>,
     seq: &mut u32,
+    profile: &P2PProfile,
+    warmup: bool,
 ) -> Result<(), String> {
     if path.is_empty() || path.bytes().any(|b| b <= 0x20 || b == 0x7f) {
         return Err("Invalid signaling request path".to_string());
     }
     let method = match body {
-        Some(_) => "DHPOST",
-        None => "DHGET",
+        Some(_) => profile.verb_post,
+        None => profile.verb_get,
     };
     let body = body.unwrap_or("");
 
-    let nonce = os_rand_u32() & 0x7FFF_FFFF;
-    let currdate = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let pwd = format!("{}{}DHP2P:{}:{}", nonce, currdate, DHP2P_WSSE_ID, DHP2P_WSSE_SEED);
-
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(pwd);
-    let hash_digest = hasher.finalize();
-    let digest = base64::engine::general_purpose::STANDARD.encode(hash_digest);
+    // OS CSPRNG nonce (signed i32 like the official InstaOn clients; SmartPSS-style profiles stay positive)
+    let nonce_raw = os_rand_u32();
+    let nonce_str = if profile.app_header_order {
+        (nonce_raw as i32).to_string()
+    } else {
+        (nonce_raw & 0x7FFF_FFFF).to_string()
+    };
+    let currdate = if profile.app_header_order {
+        chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%:z").to_string()
+    } else {
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
 
     *seq += 1;
+    let cseq_val = *seq;
+
+    let auth_block = if warmup && profile.warmup_path == "/online/stun" {
+        String::new()
+    } else {
+        let digest = compute_wsse_digest(&nonce_str, &currdate, profile.wsse_user, profile.wsse_key);
+        format!(
+            "Authorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n",
+            profile.wsse_user, digest, nonce_str, currdate
+        )
+    };
 
     let content_headers = if !body.is_empty() {
         format!("Content-Type: \r\nContent-Length: {}\r\n", body.len())
@@ -1528,10 +1757,31 @@ async fn dh_request(
         String::new()
     };
 
-    let req = format!(
-        "{} {} HTTP/1.1\r\nCSeq: {}\r\nAuthorization: WSSE profile=\"UsernameToken\"\r\nX-WSSE: UsernameToken Username=\"{}\", PasswordDigest=\"{}\", Nonce=\"{}\", Created=\"{}\"\r\n{}\r\n{}",
-        method, path, seq, DHP2P_WSSE_ID, digest, nonce, currdate, content_headers, body
-    );
+    let req = if profile.app_header_order {
+        let mut h = format!("{} {} HTTP/1.1\r\n", method, path);
+        if !warmup {
+            if let Some(v) = profile.version {
+                h.push_str(&format!("X-Version: {}\r\n", v));
+            }
+            if let Some(sv) = profile.sversion {
+                h.push_str(&format!("X-Sversion: {}\r\n", sv));
+            }
+        }
+        if let Some(tou) = profile.to_u_type {
+            h.push_str(&format!("X-ToUType: {}\r\n", tou));
+        }
+        h.push_str(&format!("CSeq: {}\r\n", cseq_val));
+        h.push_str(&auth_block);
+        h.push_str(&content_headers);
+        h.push_str("\r\n");
+        h.push_str(body);
+        h
+    } else {
+        format!(
+            "{} {} HTTP/1.1\r\nCSeq: {}\r\n{}{}\r\n{}",
+            method, path, cseq_val, auth_block, content_headers, body
+        )
+    };
 
     socket
         .send(req.as_bytes())
@@ -2691,6 +2941,56 @@ mod tests {
     fn test_ipv6_is_lan_reachable_no_panic_on_raw_literal() {
         assert!(!is_lan_reachable("::1", 1, 20));
         assert!(!is_lan_reachable("[::1]", 1, 20));
+    }
+
+    #[test]
+    fn test_profile_table_sanity_and_auth_classification() {
+        // Every profile must point at a public hostname:8800, use 32-char key material,
+        // and only emit signaling verbs / header values that cannot inject CRLF.
+        let mut names = std::collections::HashSet::new();
+        for p in DEFAULT_PROFILES {
+            assert!(names.insert(p.name), "duplicate profile name {}", p.name);
+            assert!(p.server.ends_with(":8800"), "{} server", p.name);
+            assert!(!p.server.starts_with("127.") && !p.server.starts_with("10."));
+            assert_eq!(p.wsse_key.len(), 32, "{} key length", p.name);
+            assert!(!p.wsse_user.is_empty());
+            for v in [Some(p.verb_get), Some(p.verb_post), p.to_u_type, p.version, p.sversion]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    v.bytes().all(|b| b.is_ascii_graphic() && b != b'\r' && b != b'\n'),
+                    "{} has unsafe header value",
+                    p.name
+                );
+            }
+        }
+        // First profile must stay the proven Easy4IP/SmartPSS path so existing Dahua users are unaffected.
+        assert_eq!(DEFAULT_PROFILES[0].name, "smartpss");
+
+        // Real password rejection halts the search, a profile rejection does not.
+        assert!(is_p2p_auth_rejection("AUTH_401: P2P auth error 401 (Unauthorized)"));
+        let neutral = "kvmsprolite: /online/p2psrv failed: profile rejected: Signaling HTTP 4xx (Unauthorized)";
+        assert!(!is_p2p_auth_rejection(neutral));
+    }
+
+    #[test]
+    fn test_wsse_digest_vectors() {
+        // SmartPSS golden vector
+        let d_sp = compute_wsse_digest("42", "2026-09-06T12:00:00Z", PROFILE_SMARTPSS.wsse_user, PROFILE_SMARTPSS.wsse_key);
+        assert_eq!(d_sp, "2+go9D1pKW5ykn3ePUMZkhMmITo=");
+
+        // DMSS golden vector
+        let d_dmss = compute_wsse_digest("42", "2026-09-06T12:00:00+03:00", PROFILE_DMSS.wsse_user, PROFILE_DMSS.wsse_key);
+        assert_eq!(d_dmss, "VSIOT9Z5Ht/rmuQ677AZ5CzIbOk=");
+
+        // KVMS Pro Lite live capture vector
+        let d_kvms = compute_wsse_digest("-1024243796", "2026-11-18T22:17:41+05:30", PROFILE_KVMS.wsse_user, PROFILE_KVMS.wsse_key);
+        assert_eq!(d_kvms, "uo1krIyCADVZPr5ncY/qu1vMFjw=");
+
+        // KVMS Pro Lite CTC live capture vector
+        let d_ctc = compute_wsse_digest("-328519825", "2026-11-18T22:17:45+05:30", PROFILE_KVMS_CTC.wsse_user, PROFILE_KVMS_CTC.wsse_key);
+        assert_eq!(d_ctc, "CRYtxd/C3U0Vy81a+KsbrALknZ0=");
     }
 
     #[test]

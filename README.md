@@ -46,7 +46,7 @@ Designed to stream **12+ concurrent live cameras (`1 - 32` channels)** 24/7 with
 4. **Smart Area Box Zoom (`e-PTZ`), Native Wayland Pinch & Interactive Radar Minimap:**
    - Click-drag a rectangle around any region (`1.0x - 8.0x`, `Shift+Drag` / `Box` for nested zoom, `Backspace` to step back), or use **native Wayland two-finger touchpad pinch (`zwp_pointer_gestures_v1`)**, **zero-lag trackpad/wheel scroll**, and the **interactive bottom-left wireframe radar minimap** - preserved seamlessly across both Live and Recorded Playback.
 5. **Dual-Port Cloud P2P Remote Access (`RTSP :554` + `HTTP :80` on One Session):**
-   - Built-in native Rust Dahua / CP Plus / Amcrest Cloud P2P (`easy4ipcloud.com`) authenticated PTCP tunnel (`src/p2p.rs`) multiplexing **both** live RTSP (`:554`) and NVR HTTP CGI / `/RPC2` (`:80`) over a single encrypted session with `SO_PEERCRED` local UID verification and automatic LAN <-> Cloud P2P switching.
+   - Built-in native Rust Dahua / CP Plus / Amcrest Cloud P2P authenticated PTCP tunnel (`src/p2p.rs`) with multi-profile fallback across Dahua **Easy4IP** (`easy4ipcloud.com`), **Dolynk Cloud** (`dolynkcloud.com`), and CP Plus **InstaOn Cloud** (`instaonserver.com` / `instaonserverctc.com`), multiplexing **both** live RTSP (`:554`) and NVR HTTP CGI / `/RPC2` (`:80`) over a single encrypted session with `SO_PEERCRED` local UID verification and automatic LAN <-> Cloud P2P switching.
 6. **Defense-in-Depth Security (`AuthGateway` + Canary Circuit Breaker):**
    - In-process `127.0.0.1:0` `AuthGateway` (`src/auth_gateway.rs`) strips NVR passwords from `ffmpeg`/`ffprobe` CLI args (`ps aux` / `/proc/<pid>/cmdline` never expose secrets), blocks Basic-auth downgrades, enforces `PR_SET_DUMPABLE=0` + `Zeroize` + `0600` `O_NOFOLLOW` file creation, and probes Channel 1 first to prevent multi-camera `401` NVR account lockouts.
 
@@ -146,7 +146,7 @@ Single-tap shortcuts target the **active** (selected, Single View, or hovered) c
 | Hardware Brand / Ecosystem | Proprietary Windows / Mobile Apps Replaced | Preset (`RTSP_BRAND`) & RTSP / Cloud P2P Support |
 | :--- | :--- | :--- |
 | **Dahua / IMOU / Lorex** | **SmartPSS** (`Smart PSS`), **DMSS** (`gDMSS` / `iDMSS`), **Easy4ip** (`Easy4ipCloud`), **Imou Life** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** (`rtsp://{user}:{password}@{host}:{port}/cam/realmonitor?channel={channel}&subtype={subtype}`) |
-| **CP Plus (`CPPlus`)** | **KVMS Pro** (`KVMS`), **gCMOB**, **iCMOB**, **InstaOn**, **EzyKam** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** |
+| **CP Plus (`CPPlus`)** | **KVMS Pro** (`KVMS`), **gCMOB**, **iCMOB**, **InstaOn**, **EzyKam** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** with native **InstaOn Cloud** (`instaonserver.com` & `instaonserverctc.com` via KVMS Pro Lite / gCMOB profiles) |
 | **Amcrest** | **Amcrest Surveillance Pro**, **Amcrest View Pro**, **Amcrest Cloud** | `RTSP_BRAND="dahua"` + Built-in **Cloud P2P (`RTSP_P2P_SERIAL`)** |
 | **Hikvision / HiLook / EZVIZ** | **iVMS-4200** (`iVMS`), **Hik-Connect** (`HikConnect`), **SADP** | `RTSP_BRAND="hikvision"` (`rtsp://{user}:{password}@{host}:{port}/Streaming/Channels/{channel}0{1\|2}`) + LAN / Tailscale |
 | **Reolink / TP-Link Tapo & VIGI / Uniview (`UNV`) / Axis / Foscam / Ubiquiti UniFi / ONVIF** | Reolink Client, EZView, UNV Guard, Frigate, ZoneMinder, Shinobi, Blue Iris, Agent DVR | `RTSP_BRAND="custom"` via custom `RTSP_CUSTOM_URL_TEMPLATE` (`H.265` / `HEVC` & `H.264`) |
@@ -156,7 +156,7 @@ Single-tap shortcuts target the **active** (selected, Single View, or hovered) c
 ## Frequently Asked Questions (Linux CCTV, NVR & Cloud P2P Viewer)
 
 ### How do I run Dahua SmartPSS / DMSS / Easy4ip or CP Plus KVMS Pro / gCMOB on Ubuntu & Linux?
-Proprietary Windows/mobile CCTV apps like **Dahua SmartPSS**, **DMSS**, **CP Plus KVMS Pro (`gCMOB`)**, **Amcrest Surveillance Pro**, and **Hikvision iVMS-4200** do not provide native Linux desktop clients and often crash or lag under Wine. **NVR Command Center** is a native Rust (`eframe`/`egui` OpenGL `glow`) Linux replacement (`sudo snap install nvr-command-center`) that connects directly via LAN RTSP or remote **Cloud P2P Device Serial Number (`RTSP_P2P_SERIAL`)** with zero port-forwarding required.
+Proprietary Windows/mobile CCTV apps like **Dahua SmartPSS**, **DMSS**, **CP Plus KVMS Pro (`gCMOB`)**, **Amcrest Surveillance Pro**, and **Hikvision iVMS-4200** do not provide native Linux desktop clients and often crash or lag under Wine. **NVR Command Center** is a native Rust (`eframe`/`egui` OpenGL `glow`) Linux replacement (`sudo snap install nvr-command-center`) that connects directly via LAN RTSP or remote **Cloud P2P Device Serial Number (`RTSP_P2P_SERIAL`)** with zero port-forwarding required. It natively speaks both Dahua Cloud (Easy4IP / Dolynk) and CP Plus InstaOn Cloud (`instaonserver.com` KVMS Pro / gCMOB protocols) out-of-the-box.
 
 ### How do I view RTSP IP cameras with hardware acceleration (`VAAPI` / `NVDEC`) on Linux?
 Set `HWACCEL_MODE="auto"` (default) in the in-app **Settings** modal or `.env`. Each camera worker automatically negotiates GPU hardware decoding (`VAAPI` on Intel/AMD or `NVDEC` on NVIDIA) with seamless fallback to multi-threaded software decoding, rendering up to 32 `H.265` (`HEVC`) / `H.264` camera channels at 60 FPS on a single `eframe`/`egui` OpenGL (`glow`) shader surface.
@@ -182,6 +182,12 @@ If **NVR Command Center** helps power your home lab, office security wall, or NV
 - **Developer Portfolio & Interactive Architecture Lab:** [https://pulkit-mundra-portfolio.vercel.app](https://pulkit-mundra-portfolio.vercel.app) ([NVR Case Study](https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center) | [Engineering Deep Dives](https://pulkit-mundra-portfolio.vercel.app/engineering))
 - **Buy Me a Coffee:** [https://buymeacoffee.com/pulkitmundra](https://buymeacoffee.com/pulkitmundra)
 - **GitHub Sponsors:** [https://github.com/sponsors/pulkitmundra](https://github.com/sponsors/pulkitmundra)
+
+---
+
+## Contributors
+
+- **Dinesh Manajipet ([@saidinesh5](https://github.com/saidinesh5))** - Multi-profile Cloud P2P handshake support for CP Plus InstaOn (`instaonserver.com`, `instaonserverctc.com`) and Dahua Dolynk Cloud (`dolynkcloud.com`) with WSSE digest test vectors.
 
 ---
 
