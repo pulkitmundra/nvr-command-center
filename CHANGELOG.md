@@ -2,6 +2,28 @@
 
 All notable changes to **NVR Command Center** are documented in this file.
 
+## [3.0.0] - 2026-11-19
+
+### Added
+- **Interactive "What Happened" NVR Playback & AI Event Timeline (`src/playback.rs`, `src/timeline_ui.rs`, `src/nvr_api.rs`, `src/app.rs`):**
+  - Press **`T`** (or click **`History`** in the Top Bar / **`Hist`** on any camera tile) to open `1920x1080` Main-Stream NVR playback with a **`98px` Obsidian Timeline Dock**, resizable **`200-380px` Event Drawer**, and a movable/hideable **`196x110` Live Picture-in-Picture (PiP)** corner window for `0ms` 1-click return to Live.
+  - Added **`TTT` (`2x2 Sync`)** 4-camera synchronized playback grid on Home LAN (with per-slot camera replace/swap), plus automatic live-stream pause/resume (`NvrResourceGovernor`) when scrubbing playback over remote Cloud P2P.
+  - Added **Multi-Scale Magnetic Timeline (`24h <-> 6h <-> 1h <-> 15m <-> 5m <-> 2m`)** with cursor-centered Wayland touchpad pinch + scroll-wheel zoom, `1h` preset menu & double-click reset, sub-pixel event dilation (`>= 3.5px` minimum visual width so `2s` triggers remain visible and clickable even at `24h` view), throttled live drag scrubbing, RAM-cache segment underline, `NOW` live-edge divider, editable Playhead Clock (`Ctrl+G`), calendar date picker with recorded-day badges & keyboard navigation, and semantic Obsidian color lanes (`Human` `#38BDF8`, `Vehicle` `#A78BFA`, `Intrusion/Alarm` `#EF4444`, `Motion` `#F59E0B`, and `Continuous` `#10B981`).
+  - Added **1-Click Event Drawer Actions & Stacked Toast Queue**: auto-scroll to active/nearest event, inline per-type filter counts, 1-click `[Trim]` and `[MP4]` on event cards, live export progress bar + `[X]` cancel button, background PNG encoding (capped at 3 concurrent workers) with tile shutter flash, and clickable `[Open Folder]` toasts.
+- **Smart Skip Dead-Air Engine, Zero-Glitch Trick-Play (`-4x .. 16x`) & Frame-Step (`src/playback.rs`):**
+  - Added **`Smart Skip`** with 1-click mode toggle between **`8x Fast-Glide`** (glides across empty recording at `8x`, automatically dropping to `1.0x` `3s` before matching events) and **`Instant Event Jump`** (`event.start - 3s`), filterable by `[All]`, `[Human]`, `[Vehicle]`, or `[Motion]`.
+  - Added rolling `60s` `.dav` chunk prefetching (`/cgi-bin/mediaFileFind.cgi` + `/RPC2_Login` JSON-RPC fallback + `/cgi-bin/loadfile.cgi`, Hikvision ISAPI `/ISAPI/ContentMgmt/search`, and universal RTSP `/cam/playback` fallback) backed by unlinked Linux RAM fds (`memfd_create` with `128 MiB` LRU cap and zero `/tmp` disk trace), `24`-byte `DHAV` header keyframe/RTC scanning, `-4x .. 16x` trick-play (`J` / `K` / `L`), and `0ms` `,` / `.` single-frame step via an in-RAM decoded RGBA ring buffer.
+- **Dual-Port Cloud P2P Tunneling (`RTSP :554` + `HTTP :80`), Diagnostics & `.MP4` Clip Export (`src/p2p.rs`, `src/playback.rs`, `src/app.rs`):**
+  - Upgraded `P2PTunnelManager` to multiplex both RTSP (`:554`) and HTTP CGI / `/RPC2` (`:80`) over a single authenticated `easy4ipcloud.com` UDP PTCP session so full AI timeline search, Smart Skip, and `.MP4` clip export work remotely with zero port forwarding.
+  - Added **`I` (Mark In) -> `O` (Mark Out) -> `Export MP4` (`Ctrl+E`)** lossless `-c:v copy -movflags +faststart` MP4 clip export into `~/Videos/NVR-Recordings` (`0700`/`0600`), historical-timestamped PNG snapshots (`C` / `Ctrl+S`) preserving `1.0x - 8.0x` Area Box Zoom, Settings **`Test Connection`** + inline `validate_for_save()` + cancellable `Auto-Scan (1-N)`, and `"auto"` default grid layout.
+
+### Security
+- **Zero-Leak Loopback `AuthGateway` & Canary Circuit Breaker (`src/auth_gateway.rs`, `src/stream.rs`):**
+  - Eliminated NVR credentials from `ffmpeg`/`ffprobe` CLI arguments (`/proc/<pid>/cmdline` and `ps aux`) via an in-process `127.0.0.1:0` loopback RTSP `AuthGateway` using 1-time 128-bit `OsRng` tokens, `SO_PEERCRED` UID verification, and Basic-auth downgrade blocking.
+  - Added a Channel 1 **Canary Auth Probe** and shared `AuthCircuitBreaker` so mistyped passwords halt immediately before parallel workers can trigger 12-attempt NVR account lockouts, plus background `stderr` drain threads preventing 64 KiB pipe deadlocks.
+- **Process, Tunnel & Filesystem Hardening (`src/config.rs`, `src/p2p.rs`, `src/app.rs`, `launch_viewer.sh`, `.github/workflows/snap.yml`):**
+  - Added `prctl(PR_SET_DUMPABLE, 0)`, `Zeroize` on credential drop & `.env` map cleanup, UID ownership checks on `.env` load, full ancestor + leaf symlink rejection (`reject_any_symlink_component`), `O_CREAT | O_EXCL | O_NOFOLLOW` (`0600`) snapshot/export creation with explicit `fsync`, isolated `python3 -I` + `https://` allowlist + trusted binary resolution for external openers, public-IP SSRF validation on P2P stun/relay peers, DTD-rejecting `quick-xml` parsing, `512 KiB` PTCP reorder window cap, `--locked` Cargo builds, and Amber `Cloud P2P` top-bar indicator.
+
 ## [2.2.0] - 2026-11-15
 
 ### Added

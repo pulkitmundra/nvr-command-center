@@ -2156,10 +2156,11 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "rtsp-camera-viewer"
-version = "2.2.0"
+version = "3.0.0"
 dependencies = [
  "aes",
  "base64",
+ "bytes",
  "chrono",
  "cipher",
  "eframe",
@@ -2170,6 +2171,7 @@ dependencies = [
  "md-5",
  "ofb",
  "pbkdf2",
+ "quick-xml",
  "rand",
  "raw-window-handle",
  "serde",
@@ -2177,10 +2179,11 @@ dependencies = [
  "sha1",
  "sha2",
  "tokio",
+ "url",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols",
- "xml-rs",
+ "zeroize",
 ]
 
 [[package]]
@@ -3496,6 +3499,12 @@ dependencies = [
  "syn 3.0.9",
  "synstructure",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85ccff8a4805aba1eaa4cd4afcd49f7557dd2cf5fd79ffc37f8959466effc5aa"
 
 [[package]]
 name = "zerotrie"

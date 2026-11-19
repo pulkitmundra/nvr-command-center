@@ -1,13 +1,21 @@
 mod app;
+mod auth_gateway;
 mod config;
+mod nvr_api;
 mod p2p;
+mod playback;
 mod stream;
+mod timeline_ui;
 mod wayland_pinch;
 
 use app::CameraViewerApp;
-use config::{load_env_config, locate_env_file};
+use auth_gateway::{AuthCircuitBreaker, AuthGateway};
+use config::{harden_process_security, load_env_config, locate_env_file};
 use eframe::egui;
+use p2p::{is_lan_reachable, P2PTunnelManager};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use stream::scan_active_nvr_channels;
 
 fn load_app_icon() -> Option<Arc<egui::IconData>> {
@@ -22,9 +30,11 @@ fn load_app_icon() -> Option<Arc<egui::IconData>> {
 }
 
 fn main() -> eframe::Result<()> {
+    harden_process_security();
+
     let args: Vec<String> = std::env::args().collect();
     let env_path = locate_env_file();
-    let env_cfg = load_env_config(&env_path);
+    let mut env_cfg = load_env_config(&env_path);
 
     if args.iter().any(|a| a == "--version" || a == "-v") {
         println!("nvr-command-center v{}", env!("CARGO_PKG_VERSION"));
@@ -33,7 +43,7 @@ fn main() -> eframe::Result<()> {
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!(
-            "NVR Command Center v{} (Native Rust + GPU + Cloud P2P)\n\
+            "NVR Command Center v{} (Native Rust + GPU + AI Playback + Cloud P2P)\n\
              Usage: rtsp-camera-viewer [OPTIONS]\n\n\
              Options:\n\
                --scan       Probe NVR channels 1..16 in parallel and exit\n\
@@ -45,12 +55,42 @@ fn main() -> eframe::Result<()> {
     }
 
     if args.iter().any(|a| a == "--scan") {
+        let mut p2p_mgr = P2PTunnelManager::new();
+        if !env_cfg.password.trim().is_empty()
+            && !env_cfg.p2p_serial.trim().is_empty()
+            && !env_cfg.use_tailscale
+        {
+            env_cfg.use_cloud_p2p = !is_lan_reachable(&env_cfg.host, env_cfg.port, 500);
+        }
+        if env_cfg.is_cloud_p2p_active() {
+            let (rtsp_port, http_port) = p2p_mgr.ensure_started(
+                &env_cfg.p2p_serial,
+                &env_cfg.username,
+                &env_cfg.password,
+                env_cfg.port,
+                env_cfg.http_port,
+            );
+            env_cfg.p2p_local_port = rtsp_port;
+            env_cfg.p2p_local_http_port = http_port;
+            let connected = p2p_mgr.is_connected_handle();
+            let deadline = Instant::now() + Duration::from_secs(6);
+            while !connected.load(Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        }
+
         println!(
             "Scanning channels 1..16 on {} ({})...",
-            env_cfg.active_host(),
+            if env_cfg.is_cloud_p2p_active() {
+                "Cloud P2P"
+            } else {
+                env_cfg.active_host()
+            },
             env_cfg.brand
         );
-        let active = scan_active_nvr_channels(&env_cfg, 16);
+        let auth_gw = AuthGateway::start(AuthCircuitBreaker::new())
+            .expect("Failed to start local AuthGateway");
+        let active = scan_active_nvr_channels(&env_cfg, &auth_gw, 16);
         println!("Active channels ({}): {:?}", active.len(), active);
         return Ok(());
     }
@@ -67,7 +107,7 @@ fn main() -> eframe::Result<()> {
             "NVR Command Center v{} - {} Cameras ({})",
             env!("CARGO_PKG_VERSION"),
             env_cfg.num_cameras,
-            if env_cfg.use_cloud_p2p {
+            if env_cfg.is_cloud_p2p_active() {
                 "Cloud P2P"
             } else {
                 env_cfg.active_host()

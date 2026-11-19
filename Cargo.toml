@@ -1,9 +1,9 @@
 [package]
 name = "rtsp-camera-viewer"
-version = "2.2.0"
+version = "3.0.0"
 edition = "2021"
 authors = ["Pulkit Mundra <pulkitmundra@github.com>"]
-description = "NVR Command Center - Ultra-low-latency GPU multi-camera RTSP & Cloud P2P surveillance wall in Native Rust"
+description = "NVR Command Center - GPU multi-camera RTSP, Cloud P2P & Interactive Playback surveillance suite in Native Rust"
 license = "MIT"
 repository = "https://github.com/pulkitmundra/nvr-command-center"
 
@@ -17,16 +17,19 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 libc = "0.2"
 aes = "0.8"
 base64 = "0.21"
+bytes = "1"
 cipher = "0.4"
 hmac = "0.12"
 md-5 = "0.10"
 ofb = "0.6"
 pbkdf2 = "0.12"
+quick-xml = "0.41"
 rand = "0.8"
 sha1 = "0.10"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros"] }
-xml-rs = "0.8"
+url = "2.5"
+zeroize = "1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
