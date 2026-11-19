@@ -2,6 +2,11 @@
 
 All notable changes to **NVR Command Center** are documented in this file.
 
+## [3.0.1] - 2026-11-19
+
+### Fixed
+- **Automatic LAN <-> Cloud P2P Failover (`src/app.rs`):** The route to the NVR was only chosen once at startup, so if the local network path dropped mid-session (for example a Wi-Fi range extender losing the NVR) every camera kept retrying a dead route forever. The app now probes the NVR's LAN RTSP port every `5s` on a background thread, fails over to Cloud P2P after `2` consecutive failures, and returns to Direct LAN after `3` consecutive successes, with a `45s` minimum dwell to prevent ping-pong. Picking a network mode manually pauses auto-switching for `10` minutes, and switching is deferred during clip exports, Settings edits, and timeline drags. Healthy all-live LAN sessions send no extra probes.
+
 ## [3.0.0] - 2026-11-19
 
 ### Added

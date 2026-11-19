@@ -658,6 +658,46 @@ enum NetworkTargetMode {
     CloudP2P,
 }
 
+/// Background LAN health probe cadence for automatic LAN <-> Cloud P2P failover.
+const NET_PROBE_INTERVAL: Duration = Duration::from_secs(5);
+/// TCP connect budget for each LAN probe (runs on a worker thread, never blocks the UI).
+const NET_PROBE_TIMEOUT_MS: u64 = 1_200;
+/// Consecutive failed LAN probes (~10s) before failing over from LAN to Cloud P2P.
+const LAN_FAIL_STREAK_TO_P2P: u8 = 2;
+/// Consecutive successful LAN probes (~15s) before returning from Cloud P2P to LAN.
+const LAN_OK_STREAK_TO_LAN: u8 = 3;
+/// Minimum time to stay on a mode after an automatic switch, so a flapping link
+/// cannot ping-pong every camera stream between LAN and Cloud P2P.
+const MIN_AUTO_NET_DWELL: Duration = Duration::from_secs(45);
+/// After the user manually picks a network mode, automatic failover stays paused this long.
+const MANUAL_NET_OVERRIDE_HOLD: Duration = Duration::from_secs(600);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetFailoverDecision {
+    Stay,
+    SwitchToCloudP2P,
+    SwitchToLan,
+}
+
+/// Pure hysteresis decision for automatic LAN <-> Cloud P2P failover.
+fn decide_net_failover(
+    on_cloud_p2p: bool,
+    lan_fail_streak: u8,
+    lan_ok_streak: u8,
+    dwell_elapsed: bool,
+) -> NetFailoverDecision {
+    if !dwell_elapsed {
+        return NetFailoverDecision::Stay;
+    }
+    if !on_cloud_p2p && lan_fail_streak >= LAN_FAIL_STREAK_TO_P2P {
+        NetFailoverDecision::SwitchToCloudP2P
+    } else if on_cloud_p2p && lan_ok_streak >= LAN_OK_STREAK_TO_LAN {
+        NetFailoverDecision::SwitchToLan
+    } else {
+        NetFailoverDecision::Stay
+    }
+}
+
 struct SnapshotPermit(Arc<AtomicUsize>);
 
 impl Drop for SnapshotPermit {
@@ -828,6 +868,14 @@ pub struct CameraViewerApp {
     last_window_title: String,
     rss_mb: f32,
     last_sys_poll: Instant,
+
+    net_probe_result: Arc<Mutex<Option<bool>>>,
+    net_probe_in_flight: Arc<AtomicBool>,
+    last_net_probe: Instant,
+    lan_fail_streak: u8,
+    lan_ok_streak: u8,
+    last_auto_net_switch: Option<Instant>,
+    manual_net_override_until: Option<Instant>,
 }
 
 impl CameraViewerApp {
@@ -973,6 +1021,13 @@ impl CameraViewerApp {
             last_window_title: String::new(),
             rss_mb: read_process_rss_mb(),
             last_sys_poll: Instant::now(),
+            net_probe_result: Arc::new(Mutex::new(None)),
+            net_probe_in_flight: Arc::new(AtomicBool::new(false)),
+            last_net_probe: Instant::now(),
+            lan_fail_streak: 0,
+            lan_ok_streak: 0,
+            last_auto_net_switch: None,
+            manual_net_override_until: None,
         }
     }
 
@@ -2260,61 +2315,15 @@ impl CameraViewerApp {
         true
     }
 
+    /// Manual network pick from the top-bar menu: switches, announces, and pauses
+    /// automatic LAN <-> Cloud P2P failover so it never fights the user's choice.
     fn set_network_mode(&mut self, ctx: &egui::Context, target: NetworkTargetMode) {
-        match target {
-            NetworkTargetMode::Lan => {
-                if !self.env_cfg.use_cloud_p2p && !self.env_cfg.use_tailscale {
-                    return;
-                }
-                self.env_cfg.use_cloud_p2p = false;
-                self.env_cfg.use_tailscale = false;
-                self.p2p_playback_paused_live = false;
-            }
-            NetworkTargetMode::Tailscale => {
-                if self.env_cfg.tailscale_host.trim().is_empty() {
-                    self.open_settings_modal(SettingsTab::NvrAndCameras);
-                    self.show_toast_kind(
-                        ToastKind::Info,
-                        "Enter your Tailscale NVR IP in Settings",
-                    );
-                    return;
-                }
-                if self.env_cfg.is_tailscale_active() {
-                    return;
-                }
-                self.env_cfg.use_tailscale = true;
-                self.env_cfg.use_cloud_p2p = false;
-                self.p2p_playback_paused_live = false;
-            }
-            NetworkTargetMode::CloudP2P => {
-                if self.env_cfg.p2p_serial.trim().is_empty() {
-                    self.open_settings_modal(SettingsTab::NvrAndCameras);
-                    self.show_toast_kind(
-                        ToastKind::Info,
-                        "Enter your NVR Cloud P2P Serial in Settings",
-                    );
-                    return;
-                }
-                if self.env_cfg.is_cloud_p2p_active() && !self.p2p_mgr.is_halted() {
-                    return;
-                }
-                self.env_cfg.use_cloud_p2p = true;
-                self.env_cfg.use_tailscale = false;
-                if self.p2p_mgr.is_halted() {
-                    self.p2p_mgr.clear_active_key();
-                }
-            }
+        self.manual_net_override_until = Some(Instant::now() + MANUAL_NET_OVERRIDE_HOLD);
+        self.lan_fail_streak = 0;
+        self.lan_ok_streak = 0;
+        if !self.apply_network_mode(ctx, target) {
+            return;
         }
-
-        self.edit_env_cfg.use_cloud_p2p = self.env_cfg.use_cloud_p2p;
-        self.edit_env_cfg.use_tailscale = self.env_cfg.use_tailscale;
-        self.sync_p2p_tunnel();
-        if !self.env_cfg.password.trim().is_empty() || self.env_path.exists() {
-            let _ = save_env_config(&self.env_path, &self.env_cfg);
-        }
-        self.sync_window_title(ctx);
-        self.restart_streams_with_current_env();
-
         let desc = match target {
             NetworkTargetMode::Lan => {
                 format!(
@@ -2333,6 +2342,185 @@ impl CameraViewerApp {
             NetworkTargetMode::CloudP2P => "Switched to Cloud P2P Relay".to_string(),
         };
         self.show_toast_kind(ToastKind::Info, desc);
+    }
+
+    /// Shared network switch core. Returns `true` when streams were actually restarted
+    /// on a new route (no toast, no override bookkeeping).
+    fn apply_network_mode(&mut self, ctx: &egui::Context, target: NetworkTargetMode) -> bool {
+        match target {
+            NetworkTargetMode::Lan => {
+                if !self.env_cfg.use_cloud_p2p && !self.env_cfg.use_tailscale {
+                    return false;
+                }
+                self.env_cfg.use_cloud_p2p = false;
+                self.env_cfg.use_tailscale = false;
+                self.p2p_playback_paused_live = false;
+            }
+            NetworkTargetMode::Tailscale => {
+                if self.env_cfg.tailscale_host.trim().is_empty() {
+                    self.open_settings_modal(SettingsTab::NvrAndCameras);
+                    self.show_toast_kind(
+                        ToastKind::Info,
+                        "Enter your Tailscale NVR IP in Settings",
+                    );
+                    return false;
+                }
+                if self.env_cfg.is_tailscale_active() {
+                    return false;
+                }
+                self.env_cfg.use_tailscale = true;
+                self.env_cfg.use_cloud_p2p = false;
+                self.p2p_playback_paused_live = false;
+            }
+            NetworkTargetMode::CloudP2P => {
+                if self.env_cfg.p2p_serial.trim().is_empty() {
+                    self.open_settings_modal(SettingsTab::NvrAndCameras);
+                    self.show_toast_kind(
+                        ToastKind::Info,
+                        "Enter your NVR Cloud P2P Serial in Settings",
+                    );
+                    return false;
+                }
+                if self.env_cfg.is_cloud_p2p_active() && !self.p2p_mgr.is_halted() {
+                    return false;
+                }
+                self.env_cfg.use_cloud_p2p = true;
+                self.env_cfg.use_tailscale = false;
+                if self.p2p_mgr.is_halted() {
+                    self.p2p_mgr.clear_active_key();
+                }
+            }
+        }
+
+        self.edit_env_cfg.use_cloud_p2p = self.env_cfg.use_cloud_p2p;
+        self.edit_env_cfg.use_tailscale = self.env_cfg.use_tailscale;
+        self.sync_p2p_tunnel();
+        if !self.env_cfg.password.trim().is_empty() || self.env_path.exists() {
+            let _ = save_env_config(&self.env_path, &self.env_cfg);
+        }
+        self.sync_window_title(ctx);
+        self.restart_streams_with_current_env();
+        true
+    }
+
+    /// Automatic LAN <-> Cloud P2P failover. The app used to choose a route only once at
+    /// startup, so if the LAN path to the NVR dropped mid-session every camera kept
+    /// retrying a dead route forever. This probes the NVR's LAN RTSP port on a worker
+    /// thread every 5s and fails over (and back) with hysteresis + a minimum dwell time.
+    fn tick_network_failover(&mut self, ctx: &egui::Context) {
+        // Only when both routes are configured and the user has not chosen Tailscale.
+        let eligible = !self.env_cfg.p2p_serial.trim().is_empty()
+            && !self.env_cfg.password.trim().is_empty()
+            && !self.env_cfg.use_tailscale
+            && !self.env_cfg.host.trim().is_empty();
+        if !eligible {
+            self.lan_fail_streak = 0;
+            self.lan_ok_streak = 0;
+            return;
+        }
+        if self
+            .manual_net_override_until
+            .is_some_and(|until| Instant::now() < until)
+        {
+            self.lan_fail_streak = 0;
+            self.lan_ok_streak = 0;
+            return;
+        }
+
+        // 1. Fold in the latest finished probe result.
+        let finished = self.net_probe_result.lock().ok().and_then(|mut g| g.take());
+        if let Some(lan_ok) = finished {
+            if lan_ok {
+                self.lan_ok_streak = self.lan_ok_streak.saturating_add(1);
+                self.lan_fail_streak = 0;
+            } else {
+                self.lan_fail_streak = self.lan_fail_streak.saturating_add(1);
+                self.lan_ok_streak = 0;
+            }
+        }
+
+        let on_cloud_p2p = self.env_cfg.is_cloud_p2p_active();
+
+        // 2. Schedule the next probe. While on LAN with every camera live, skip probing
+        //    entirely so a healthy NVR never sees extra connections.
+        let all_live = (1..=self.app_cfg.num_cameras).all(|ch| {
+            self.stream_mgr
+                .slot(ch)
+                .is_some_and(|s| s.status() == StreamStatus::Live)
+        });
+        let should_probe = on_cloud_p2p || !all_live;
+        if !should_probe {
+            self.lan_fail_streak = 0;
+        } else if self.last_net_probe.elapsed() >= NET_PROBE_INTERVAL
+            && !self.net_probe_in_flight.load(Ordering::Acquire)
+        {
+            self.last_net_probe = Instant::now();
+            self.net_probe_in_flight.store(true, Ordering::Release);
+            let host = self.env_cfg.host.trim().to_string();
+            let port = self.env_cfg.port;
+            let result_ref = Arc::clone(&self.net_probe_result);
+            let in_flight_ref = Arc::clone(&self.net_probe_in_flight);
+            let spawned = thread::Builder::new()
+                .name("nvr-lan-probe".to_string())
+                .spawn(move || {
+                    let ok = is_lan_reachable(&host, port, NET_PROBE_TIMEOUT_MS);
+                    if let Ok(mut g) = result_ref.lock() {
+                        *g = Some(ok);
+                    }
+                    in_flight_ref.store(false, Ordering::Release);
+                });
+            if spawned.is_err() {
+                self.net_probe_in_flight.store(false, Ordering::Release);
+            }
+        }
+
+        // 3. Never yank the route out from under an export, a settings edit, or a scrub.
+        if self.show_settings
+            || self.playback_mgr.export_state().in_progress
+            || self.timeline_ui.is_actively_dragging()
+        {
+            return;
+        }
+
+        let dwell_elapsed = self
+            .last_auto_net_switch
+            .is_none_or(|t| t.elapsed() >= MIN_AUTO_NET_DWELL);
+        match decide_net_failover(
+            on_cloud_p2p,
+            self.lan_fail_streak,
+            self.lan_ok_streak,
+            dwell_elapsed,
+        ) {
+            NetFailoverDecision::Stay => {}
+            NetFailoverDecision::SwitchToCloudP2P => {
+                let host = self.env_cfg.host.trim().to_string();
+                self.lan_fail_streak = 0;
+                self.lan_ok_streak = 0;
+                if self.apply_network_mode(ctx, NetworkTargetMode::CloudP2P) {
+                    self.last_auto_net_switch = Some(Instant::now());
+                    self.last_net_probe = Instant::now();
+                    self.show_toast_kind(
+                        ToastKind::Warning,
+                        format!(
+                            "Lost local connection to NVR ({}) - switched to Cloud P2P automatically",
+                            host
+                        ),
+                    );
+                }
+            }
+            NetFailoverDecision::SwitchToLan => {
+                self.lan_fail_streak = 0;
+                self.lan_ok_streak = 0;
+                if self.apply_network_mode(ctx, NetworkTargetMode::Lan) {
+                    self.last_auto_net_switch = Some(Instant::now());
+                    self.last_net_probe = Instant::now();
+                    self.show_toast_kind(
+                        ToastKind::Success,
+                        "Local NVR reachable again - switched back to fast Direct LAN",
+                    );
+                }
+            }
+        }
     }
 
     fn is_patrol_user_busy(&self, ctx: &egui::Context) -> bool {
@@ -7335,6 +7523,9 @@ impl eframe::App for CameraViewerApp {
         // Poll background PNG snapshots, Test Connection, and Auto-Scan completions
         self.poll_background_jobs();
 
+        // Automatic LAN <-> Cloud P2P failover when the local route to the NVR drops or returns
+        self.tick_network_failover(ctx);
+
         // Poll process RSS memory every 2s
         if self.last_sys_poll.elapsed() >= Duration::from_secs(2) {
             self.rss_mb = read_process_rss_mb();
@@ -8215,6 +8406,24 @@ fn open_url(ctx: &egui::Context, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_net_failover_hysteresis_and_dwell() {
+        use NetFailoverDecision::*;
+        // On LAN: one failed probe is not enough, two consecutive failures fail over.
+        assert_eq!(decide_net_failover(false, 1, 0, true), Stay);
+        assert_eq!(decide_net_failover(false, LAN_FAIL_STREAK_TO_P2P, 0, true), SwitchToCloudP2P);
+        // On LAN, healthy probes never trigger a switch.
+        assert_eq!(decide_net_failover(false, 0, 10, true), Stay);
+        // On Cloud P2P: needs three consecutive LAN successes to return.
+        assert_eq!(decide_net_failover(true, 0, 2, true), Stay);
+        assert_eq!(decide_net_failover(true, 0, LAN_OK_STREAK_TO_LAN, true), SwitchToLan);
+        // On Cloud P2P, LAN failures keep us on P2P.
+        assert_eq!(decide_net_failover(true, 5, 0, true), Stay);
+        // Minimum dwell blocks any switch, preventing LAN <-> P2P ping-pong on a flapping link.
+        assert_eq!(decide_net_failover(false, 9, 0, false), Stay);
+        assert_eq!(decide_net_failover(true, 0, 9, false), Stay);
+    }
 
     #[test]
     fn test_safe_clamp_never_panics_on_narrow_viewports() {
