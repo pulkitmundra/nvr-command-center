@@ -1,6 +1,6 @@
 # NVR Command Center v3.0 (Native Rust + GPU + AI Playback + Cloud P2P)
 
-[![Version](https://img.shields.io/badge/version-3.0.1-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
+[![Version](https://img.shields.io/badge/version-3.0.2-blue.svg)](https://github.com/pulkitmundra/nvr-command-center/releases)
 [![Snap Store](https://img.shields.io/badge/Snap_Store-nvr--command--center-82BEA0?logo=snapcraft&logoColor=white)](https://snapcraft.io/nvr-command-center)
 [![Case Study](https://img.shields.io/badge/Case_Study-Interactive_Demo-10B981?logo=vercel&logoColor=white)](https://pulkit-mundra-portfolio.vercel.app/projects/nvr-command-center)
 [![Architecture Deep Dive](https://img.shields.io/badge/Deep_Dive-64KB_Linux_Pipe_Trap-0EA5E9?logo=linux&logoColor=white)](https://pulkit-mundra-portfolio.vercel.app/engineering/python-to-rust-12-camera-nvr-linux-pipe-trap)

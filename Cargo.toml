@@ -1,6 +1,6 @@
 [package]
 name = "rtsp-camera-viewer"
-version = "3.0.1"
+version = "3.0.2"
 edition = "2021"
 authors = ["Pulkit Mundra <pulkitmundra@github.com>"]
 description = "NVR Command Center - GPU multi-camera RTSP, Cloud P2P & Interactive Playback surveillance suite in Native Rust"

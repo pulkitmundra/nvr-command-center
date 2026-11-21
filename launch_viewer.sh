@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch script for NVR Command Center v3.0.1 (Native Rust + GPU + Interactive Playback)
+# Launch script for NVR Command Center v3.0.2 (Native Rust + GPU + Interactive Playback)
 # Supports: start | stop | toggle | status | restart | scan | help
 
 umask 077
@@ -55,7 +55,7 @@ find_viewer_pids() {
 
 ensure_binary() {
     if [ ! -x "$BINARY_PATH" ]; then
-        echo "Building NVR Command Center v3.0.1 release binary..."
+        echo "Building NVR Command Center v3.0.2 release binary..."
         cd "$SCRIPT_DIR" || exit 1
         if command -v cargo >/dev/null 2>&1; then
             cargo build --release --locked
@@ -90,7 +90,7 @@ is_running() {
 start_viewer() {
     ensure_binary
     rotate_log_if_needed
-    echo "Starting NVR Command Center v3.0.1..."
+    echo "Starting NVR Command Center v3.0.2..."
     cd "$SCRIPT_DIR" || exit 1
 
     USER_RUN_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"

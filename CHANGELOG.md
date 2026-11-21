@@ -2,6 +2,14 @@
 
 All notable changes to **NVR Command Center** are documented in this file.
 
+## [3.0.2] - 2026-11-21
+
+### Added
+- **CP Plus InstaOn & Dahua Dolynk Multi-Profile Cloud P2P (`src/p2p.rs`, `README.md`):** Contributed by **Dinesh Manajipet ([@saidinesh5](https://github.com/saidinesh5))**. Upgraded the Cloud P2P handshake to fall back cleanly across multiple OEM cloud signaling profiles (`SmartPSS` / `www.easy4ipcloud.com`, `DMSS` / `p2p.dolynkcloud.com`, `KVMS Pro Lite` / `instaonserver.com`, `KVMS-CTC` / `instaonserverctc.com`, plus experimental `gCMOB` and `gCMOB-CTC` profiles), with bounded per-request signaling timeouts and verified WSSE digest unit test vectors.
+
+### Security & Fixed
+- **Cloud P2P Profile-Fallback & Hardening (`src/p2p.rs`):** Preserved public-IP SSRF validation (`connect_public_udp`) across every profile server, replaced PRNG WSSE nonces with OS CSPRNG (`os_rand_u32`), and fixed a false auth-lockout condition where an HTTP `401`/`403` at `/online/p2psrv` (before NVR credentials are sent) aborted fallback before CP Plus InstaOn profiles were attempted.
+
 ## [3.0.1] - 2026-11-19
 
 ### Fixed
